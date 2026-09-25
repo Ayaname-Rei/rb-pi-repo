@@ -1,0 +1,8 @@
+# 数据集的绝对路径
+path: D:/RoboGame/yolo/RG_Dataset
+train: images/train
+val: images/val
+
+# 类别数量与名称 (必须与标注时的按键 0 和 1 对应)
+nc: 2
+names: ['Purple_Block', 'Orange_Block']

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<NewDataSet>
+  <Type>BUS Servo</Type>
+  <Table>
+    <ID>1</ID>
+    <Move>#1 P226 #2 P500 #3 P177 #4 P129 #5 P408 #6 P500</Move>
+    <Time>T1500</Time>
+    <ID>2</ID>
+    <Move>#1 P236 #2 P500 #3 P177 #4 P129 #5 P408 #6 P500</Move>
+    <Time>T1500</Time>
+    <ID>3</ID>
+    <Move>#1 P226 #2 P500 #3 P177 #4 P129 #5 P408 #6 P500</Move>
+    <Time>T1500</Time>
+  </Table>
+</NewDataSet>

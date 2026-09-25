@@ -1,0 +1,12 @@
+# 香橙派（Orange Pi 4 Pro / aarch64）视觉节点依赖
+# 安装: pip3 install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#
+# 注意（沿用树莓派 docs/ENVIRONMENT.md 的踩坑记录）：
+# - torch 必须钉 2.9.0：其 CUDA 依赖在 aarch64 上标记为假，一个 NVIDIA 库都不会装
+# - numpy 必须 <2：否则破坏 apt 版 cv2 的 ABI
+# - 若 /etc/pip.conf 配了 piwheels 源，加 PIP_CONFIG_FILE=/dev/null 前缀
+numpy==1.26.4
+torch==2.9.0
+torchvision==0.24.0
+ultralytics==8.4.157
+opencv-python==4.11.0.86

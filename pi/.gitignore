@@ -1,0 +1,19 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Operating System files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+
+# Logs and databases
+*.log
+*.sqlite3
+
+# IDE / Editor
+.idea/
+*.swp
+*.swo

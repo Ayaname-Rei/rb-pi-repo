@@ -1,0 +1,17 @@
+[Unit]
+Description=RoboGame 2026 AutoStart Mission Service
+After=network.target multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=simple
+User=pinqu
+WorkingDirectory=/home/pinqu/robot-stack/robogame_project
+ExecStart=/usr/bin/python3 run_autostart.py
+Restart=no
+StandardOutput=append:/home/pinqu/robot-stack/robogame_project/run.log
+StandardError=append:/home/pinqu/robot-stack/robogame_project/run.log
+
+[Install]
+WantedBy=multi-user.target
+

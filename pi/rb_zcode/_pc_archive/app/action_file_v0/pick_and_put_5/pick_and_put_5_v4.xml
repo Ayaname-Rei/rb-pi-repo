@@ -1,0 +1,39 @@
+<?xml version="1.0" ?>
+<NewDataSet>
+  <Type>BUS Servo</Type>
+  <Table>
+    <ID>1</ID>
+    <Move>#1 P376 #2 P500 #3 P177 #4 P293 #5 P420 #6 P500</Move>
+    <Time>T1000</Time>
+    <ID>2</ID>
+    <Move>#1 P376 #2 P500 #3 P177 #4 P293 #5 P324 #6 P380</Move>
+    <Time>T500</Time>
+    <ID>3</ID>
+    <Move>#1 P376 #2 P500 #3 P324 #4 P293 #5 P324 #6 P380</Move>
+    <Time>T500</Time>
+    <ID>4</ID>
+    <Move>#1 P376 #2 P500 #3 P324 #4 P293 #5 P324 #6 P125</Move>
+    <Time>T500</Time>
+    <ID>5</ID>
+    <Move>#1 P376 #2 P500 #3 P324 #4 P372 #5 P396 #6 P125</Move>
+    <Time>T500</Time>
+    <ID>6</ID>
+    <Move>#1 P376 #2 P500 #3 P324 #4 P460 #5 P540 #6 P125</Move>
+    <Time>T500</Time>
+    <ID>7</ID>
+    <Move>#1 P376 #2 P500 #3 P324 #4 P428 #5 P545 #6 P125</Move>
+    <Time>T500</Time>
+    <ID>8</ID>
+    <Move>#1 P200 #2 P500 #3 P324 #4 P428 #5 P545 #6 P125</Move>
+    <Time>T500</Time>
+    <ID>9</ID>
+    <Move>#1 P200 #2 P500 #3 P324 #4 P428 #5 P420 #6 P125</Move>
+    <Time>T500</Time>
+    <ID>10</ID>
+    <Move>#1 P200 #2 P500 #3 P177 #4 P293 #5 P420 #6 P350</Move>
+    <Time>T500</Time>
+    <ID>11</ID>
+    <Move>#1 P200 #2 P500 #3 P177 #4 P293 #5 P420 #6 P500</Move>
+    <Time>T500</Time>
+  </Table>
+</NewDataSet>
