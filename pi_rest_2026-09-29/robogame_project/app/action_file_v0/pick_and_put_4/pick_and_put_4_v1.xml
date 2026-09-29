@@ -1,0 +1,18 @@
+<?xml version="1.0" ?>
+<NewDataSet>
+  <Type>PWM Servo</Type>
+  <Table>
+    <ID>1</ID>
+    <Move>#1 P376 #2 P500 #3 P177 #4 P293 #5 P420 #6 P500</Move>
+    <Time>T1000</Time>
+    <ID>2</ID>
+    <Move>#1 P376 #2 P500 #3 P177 #4 P293 #5 P420 #6 P348</Move>
+    <Time>T400</Time>
+    <ID>3</ID>
+    <Move>#1 P376 #2 P500 #3 P177 #4 P404 #5 P420 #6 P348</Move>
+    <Time>T200</Time>
+    <ID>4</ID>
+    <Move>#1 P376 #2 P500 #3 P177 #4 P404 #5 P420 #6 P125</Move>
+    <Time>T400</Time>
+  </Table>
+</NewDataSet>

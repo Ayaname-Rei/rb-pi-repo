@@ -1,0 +1,147 @@
+===========================================================================
+      RoboGame 2026 YOLO 推理加速方案真机精度与速度对比评测
+===========================================================================
+1. 正在从 Camera 0 (/dev/video0) 采集实时测试画面...
+   ✅ 获取图像成功，分辨率: 1280x720
+
+2. 加载基础 PyTorch 模型 (best.pt)...
+   * 包含类别: {0: 'Purple_Block', 1: 'Orange_Block'}
+
+3. 各分辨率推理精度与中心定位坐标实测 (针对同张画面):
+---------------------------------------------------------------------------
+
+[测试项: imgsz = 640] (单次推理耗时: 4313.7ms)
+  检测到目标数: 3
+    目标 1: 类别=Purple_Block   | 置信度=0.867 | 中心点(cx, cy)=( 243.6,  355.1)
+    目标 2: 类别=Orange_Block   | 置信度=0.852 | 中心点(cx, cy)=( 942.5,  346.4)
+    目标 3: 类别=Orange_Block   | 置信度=0.485 | 中心点(cx, cy)=( 992.0,  344.2)
+
+[测试项: imgsz = 480] (单次推理耗时: 457.0ms)
+  检测到目标数: 2
+    目标 1: 类别=Orange_Block   | 置信度=0.826 | 中心点(cx, cy)=( 940.8,  345.1)
+    目标 2: 类别=Purple_Block   | 置信度=0.656 | 中心点(cx, cy)=( 241.8,  354.8)
+
+[测试项: imgsz = 320] (单次推理耗时: 228.0ms)
+  检测到目标数: 1
+    目标 1: 类别=Orange_Block   | 置信度=0.572 | 中心点(cx, cy)=( 943.7,  342.2)
+
+[测试项: imgsz = 256] (单次推理耗时: 166.5ms)
+  检测到目标数: 1
+    目标 1: 类别=Purple_Block   | 置信度=0.678 | 中心点(cx, cy)=( 241.6,  353.8)
+
+===========================================================================
+4. 中心定位坐标偏差对比 (以默认 640 分辨率为基准):
+---------------------------------------------------------------------------
+     配置      |      目标名称      |     基准(640)中心      |        当前中心        |    像素偏移量 (Δx, Δy)   
+---------------------------------------------------------------------------
+ imgsz=480   | Purple_Block   | ( 243.6,  355.1) | ( 241.8,  354.8) | Δx= -1.8px, Δy= -0.4px (置信度 -0.21)
+ imgsz=480   | Orange_Block   | ( 942.5,  346.4) | ( 940.8,  345.1) | Δx= -1.7px, Δy= -1.3px (置信度 -0.03)
+ imgsz=480   | Orange_Block   | ( 992.0,  344.2) | ( 940.8,  345.1) | Δx=-51.2px, Δy= +0.9px (置信度 +0.34)
+ imgsz=320   | Purple_Block   | ⚠️ 未匹配到目标！
+ imgsz=320   | Orange_Block   | ( 942.5,  346.4) | ( 943.7,  342.2) | Δx= +1.2px, Δy= -4.2px (置信度 -0.28)
+ imgsz=320   | Orange_Block   | ( 992.0,  344.2) | ( 943.7,  342.2) | Δx=-48.3px, Δy= -2.0px (置信度 +0.09)
+ imgsz=256   | Purple_Block   | ( 243.6,  355.1) | ( 241.6,  353.8) | Δx= -1.9px, Δy= -1.3px (置信度 -0.19)
+ imgsz=256   | Orange_Block   | ⚠️ 未匹配到目标！
+ imgsz=256   | Orange_Block   | ⚠️ 未匹配到目标！
+
+===========================================================================
+5. 连续 15 轮稳定推理时延压测 (去除冷启动):
+---------------------------------------------------------------------------
+        模型配置         |   平均耗时 (ms)    |   最快 (ms)    |   最慢 (ms)    |   等效帧率 (FPS)  
+---------------------------------------------------------------------------
+ PyTorch imgsz=640     |      711.6 ms   |    705.1 ms  |    716.4 ms  |      1.4 FPS
+ PyTorch imgsz=480     |      419.7 ms   |    417.7 ms  |    422.4 ms  |      2.4 FPS
+ PyTorch imgsz=320     |      209.8 ms   |    209.1 ms  |    212.1 ms  |      4.8 FPS
+ PyTorch imgsz=256     |      149.2 ms   |    148.6 ms  |    149.7 ms  |      6.7 FPS
+
+===========================================================================
+6. 尝试方案二：模型格式轻量化编译 (NCNN / ONNX)...
+---------------------------------------------------------------------------
+  * 正在检测/导出 NCNN 格式 (针对 ARM NEON 指令集极致优化)...
+Ultralytics 8.4.157 🚀 Python-3.11.2 torch-2.9.0+cpu CPU (aarch64)
+YOLO26n summary (fused): 120 layers, 2,375,226 parameters, 0 gradients, 1.3 GFLOPs
+
+[34m[1mPyTorch:[0m starting from 'best.pt' with input shape (1, 3, 320, 320) BCHW and output shape(s) (1, 6, 2100) (5.1 MB)
+[31m[1mrequirements:[0m Ultralytics requirement ['ncnn'] not found, attempting AutoUpdate...
+WARNING ⚠️ Retry 1/2 failed: Command '['/usr/bin/python3', '-m', 'pip', 'install', '--no-cache-dir', 'ncnn', '--no-deps']' returned non-zero exit status 1.
+WARNING ⚠️ Retry 2/2 failed: Command '['/usr/bin/python3', '-m', 'pip', 'install', '--no-cache-dir', 'ncnn', '--no-deps']' returned non-zero exit status 1.
+WARNING ⚠️ [31m[1mrequirements:[0m ❌ Command '['/usr/bin/python3', '-m', 'pip', 'install', '--no-cache-dir', 'ncnn', '--no-deps']' returned non-zero exit status 1.
+error: externally-managed-environment
+
+× This environment is externally managed
+╰─> To install Python packages system-wide, try apt install
+    python3-xyz, where xyz is the package you are trying to
+    install.
+    
+    If you wish to install a non-Debian-packaged Python package,
+    create a virtual environment using python3 -m venv path/to/venv.
+    Then use path/to/venv/bin/python and path/to/venv/bin/pip. Make
+    sure you have python3-full installed.
+    
+    For more information visit http://rptl.io/venv
+
+note: If you believe this is a mistake, please contact your Python installation or OS distribution provider. You can override this, at the risk of breaking your Python installation or OS, by passing --break-system-packages.
+hint: See PEP 668 for the detailed specification.
+
+[31m[1mrequirements:[0m Ultralytics requirement ['pnnx==20260526'] not found, attempting AutoUpdate...
+WARNING ⚠️ Retry 1/2 failed: Command '['/usr/bin/python3', '-m', 'pip', 'install', '--no-cache-dir', 'pnnx==20260526']' returned non-zero exit status 1.
+WARNING ⚠️ Retry 2/2 failed: Command '['/usr/bin/python3', '-m', 'pip', 'install', '--no-cache-dir', 'pnnx==20260526']' returned non-zero exit status 1.
+WARNING ⚠️ [31m[1mrequirements:[0m ❌ Command '['/usr/bin/python3', '-m', 'pip', 'install', '--no-cache-dir', 'pnnx==20260526']' returned non-zero exit status 1.
+error: externally-managed-environment
+
+× This environment is externally managed
+╰─> To install Python packages system-wide, try apt install
+    python3-xyz, where xyz is the package you are trying to
+    install.
+    
+    If you wish to install a non-Debian-packaged Python package,
+    create a virtual environment using python3 -m venv path/to/venv.
+    Then use path/to/venv/bin/python and path/to/venv/bin/pip. Make
+    sure you have python3-full installed.
+    
+    For more information visit http://rptl.io/venv
+
+note: If you believe this is a mistake, please contact your Python installation or OS distribution provider. You can override this, at the risk of breaking your Python installation or OS, by passing --break-system-packages.
+hint: See PEP 668 for the detailed specification.
+
+ERROR ❌ [34m[1mNCNN:[0m export failure 8.3s: No module named 'ncnn'
+Export to NCNN in the cloud with Ultralytics Platform: https://platform.ultralytics.com
+  ℹ️ NCNN 导出/运行跳过: No module named 'ncnn'
+  * 正在检测/导出 ONNX 格式...
+Ultralytics 8.4.157 🚀 Python-3.11.2 torch-2.9.0+cpu CPU (aarch64)
+YOLO26n summary (fused): 120 layers, 2,375,226 parameters, 0 gradients, 1.3 GFLOPs
+
+[34m[1mPyTorch:[0m starting from 'best.pt' with input shape (1, 3, 320, 320) BCHW and output shape(s) (1, 6, 2100) (5.1 MB)
+[31m[1mrequirements:[0m Ultralytics requirements ['onnx>=1.12.0,<2.0.0', 'onnxruntime', 'onnxslim>=0.1.82'] not found, attempting AutoUpdate...
+WARNING ⚠️ Retry 1/2 failed: Command '['/usr/bin/python3', '-m', 'pip', 'install', '--no-cache-dir', 'onnx>=1.12.0,<2.0.0', 'onnxruntime', 'onnxslim>=0.1.82']' returned non-zero exit status 1.
+WARNING ⚠️ Retry 2/2 failed: Command '['/usr/bin/python3', '-m', 'pip', 'install', '--no-cache-dir', 'onnx>=1.12.0,<2.0.0', 'onnxruntime', 'onnxslim>=0.1.82']' returned non-zero exit status 1.
+WARNING ⚠️ [31m[1mrequirements:[0m ❌ Command '['/usr/bin/python3', '-m', 'pip', 'install', '--no-cache-dir', 'onnx>=1.12.0,<2.0.0', 'onnxruntime', 'onnxslim>=0.1.82']' returned non-zero exit status 1.
+error: externally-managed-environment
+
+× This environment is externally managed
+╰─> To install Python packages system-wide, try apt install
+    python3-xyz, where xyz is the package you are trying to
+    install.
+    
+    If you wish to install a non-Debian-packaged Python package,
+    create a virtual environment using python3 -m venv path/to/venv.
+    Then use path/to/venv/bin/python and path/to/venv/bin/pip. Make
+    sure you have python3-full installed.
+    
+    For more information visit http://rptl.io/venv
+
+note: If you believe this is a mistake, please contact your Python installation or OS distribution provider. You can override this, at the risk of breaking your Python installation or OS, by passing --break-system-packages.
+hint: See PEP 668 for the detailed specification.
+
+ERROR ❌ [34m[1mONNX:[0m export failure 4.2s: No module named 'onnx'
+Export to ONNX in the cloud with Ultralytics Platform: https://platform.ultralytics.com
+  ℹ️ ONNX 导出/运行跳过: No module named 'onnx'
+
+===========================================================================
+                      评测总结与最终结论
+===========================================================================
+  * PyTorch imgsz=640     :  711.6 ms  (加速比:  1.0x)
+  * PyTorch imgsz=480     :  419.7 ms  (加速比:  1.7x)
+  * PyTorch imgsz=320     :  209.8 ms  (加速比:  3.4x)
+  * PyTorch imgsz=256     :  149.2 ms  (加速比:  4.8x)
+===========================================================================

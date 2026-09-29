@@ -1,0 +1,47 @@
+# 推送命令（把本文件夹上传到 GitHub 的新建文件夹中）
+
+仓库：git@github.com:Ayaname-Rei/rb-pi-repo.git（main 分支）
+本文件夹 = pi 工作目录中尚未上传的全部内容（robogame_project 原版、README、docs、
+rb_competition_full.zip、opt_result.txt、pi_cmd.py、两份 analysis.md）。
+已上传过的部分：rb_zcode/ → 仓库内 rb_zcode_2026-09-27/（main=3775f47），无需重传。
+
+在 Git Bash 或 PowerShell 中按顺序执行（# 开头为注释）：
+
+cd D:\competition_code\rb_competition_code\rb_pi\pi
+
+# 1) 克隆仓库到临时目录
+git clone git@github.com:Ayaname-Rei/rb-pi-repo.git _tmp_push
+cd _tmp_push
+
+# 2) 启用 Git LFS 并跟踪 zip —— 必须！
+#    rb_competition_full.zip 有 142.9MB，超过 GitHub 单文件 100MB 硬性上限，
+#    不走 LFS 推送会被直接拒绝。
+git lfs install
+git lfs track "*.zip"
+git add .gitattributes
+
+# 3) 把本文件夹复制进仓库（新文件夹名自定，这里用 pi_rest_2026-09-29）
+#    PowerShell 用:  robocopy "..\待上传内容_2026-09-29" "pi_rest_2026-09-29" /E
+#    Git Bash 用:
+cp -r "../待上传内容_2026-09-29" "pi_rest_2026-09-29"
+
+# 4) 提交并推送
+git add pi_rest_2026-09-29
+git commit -m "Add pi rest snapshot 2026-09-29: original robogame_project, docs, full zip, analysis files"
+git push origin main
+
+# 5) 验证（应显示包含你刚推送提交的新哈希）
+git ls-remote git@github.com:Ayaname-Rei/rb-pi-repo.git refs/heads/main
+
+# 6) 确认无误后，删除临时目录（连同其 GitHub 连接和全部内容）
+cd ..
+rmdir /s /q _tmp_push        # PowerShell 也可用: Remove-Item -Recurse -Force _tmp_push
+
+# ── 备注 ──
+# · 若 git lfs 命令不存在：winget install GitHub.GitLFS（或从 git-lfs.github.com 下载），
+#   装完重开终端再从第 2 步开始。
+# · 仓库里已有一个 ~142.9MB 的 LFS 对象（旧备份）。若第 4 步推送时 LFS 提示对象已存在
+#   或配额错误：clone 后先执行 git lfs ls-files 看看 rb_competition_full.zip 是否已在
+#   仓库里——已在就删掉本文件夹里的 zip 再提交其余内容（其余全部 <100MB）。
+# · push 时若提示 fetch first / non-fast-forward：先 git pull --refit --rebase origin main
+#   （或 git pull origin main）再重新 push。
