@@ -1,0 +1,1627 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""树莓派运动控制节点：路线巡航（直线+转弯）→ 撞墙 → 视觉停车 → 机械臂抓取。
+
+路径规划仅支持两种基本动作：
+  - 直线平移（前后/左右，vx/vy 严格互斥，wz=0）
+  - 原地旋转（通过 A 板 move,0,0,dyaw 陀螺仪硬件闭环）
+
+不使用任何斜向运动或速度混合。每段动作之间会平稳停车后再执行下一段。
+"""
+import argparse
+import math
+import sys
+import os
+import threading
+import time
+import socket
+import json
+
+# 将 arm 目录加入系统路径，确保能够直接导入 arm_driver
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "arm"))
+
+from core.chassis_driver import ChassisDriver
+from core.protocol import format_move_cmd
+from arm.arm_runner_demo import ArmController
+
+from config import (
+    CHASSIS_PORT, CHASSIS_BAUDRATE, ARM_PORT,
+    CALIB, ID1_XML, ID2_XML, VISION_SERVER_IP, VISION_SERVER_PORT,
+    SEGMENTS, VEL, SLOW, DECEL, BLEND_STEPS,
+    TURN_TIMEOUT, TURN_SETTLE,
+    WALL_PURPLE_MAX, WALL_PURPLE_END_SPEED, WALL_PURPLE_DECEL_DIST,
+    WALL_PURPLE_VEL_THRESH, WALL_PURPLE_POS_THRESH, WALL_PURPLE_STALL_TIME,
+    WALL_ORANGE_MAX, WALL_ORANGE_END_SPEED, WALL_ORANGE_DECEL_DIST,
+    WALL_ORANGE_VEL_THRESH, WALL_ORANGE_POS_THRESH, WALL_ORANGE_STALL_TIME,
+    WALL_BUILD_MAX, WALL_BUILD_END_SPEED, WALL_BUILD_DECEL_DIST,
+    WALL_BUILD_VEL_THRESH, WALL_BUILD_POS_THRESH, WALL_BUILD_STALL_TIME,
+    GRAB_SPEED, GRAB_MAX, CONFIRM, WARMUP_SECONDS,
+    DIST_PURPLE_TO_FAR_ORANGE, ENABLE_NEXT_STATION,
+    DIST_AFTER_PURPLE_RIGHT, DIST_AFTER_ORANGE_RIGHT,
+    DIST_RETURN_FORWARD, DIST_RETURN_LEFT,
+    SEGMENTS_TO_ORANGE, SEGMENTS_RETURN,
+    ID_ORANGE_MID, ID_BUILD_1, ID_BUILD_2, ID_BUILD_3, ID_BUILD_4, ID_BUILD_5,
+    ID_BUILD_6, ID_BUILD_7,
+    ID_NEAR_ORANGE_LEFT, SEGMENTS_TO_NEAR_ORANGE, SEGMENTS_TO_SECOND_BUILD,
+    WALL_NEAR_ORANGE_MAX, WALL_NEAR_ORANGE_END_SPEED, WALL_NEAR_ORANGE_DECEL_DIST,
+    WALL_NEAR_ORANGE_VEL_THRESH, WALL_NEAR_ORANGE_POS_THRESH, WALL_NEAR_ORANGE_STALL_TIME,
+    WALL_SECOND_BUILD_FORWARD_MAX, WALL_SECOND_BUILD_LEFT_MAX,
+    STAGE14_BACK_1, STAGE14_TURN_1, STAGE14_WALL_RIGHT_1,
+    STAGE16_LEFT_1, STAGE16_ABS_X, STAGE16_TURN_1, STAGE16_FORWARD_1, STAGE16_WALL_LEFT_1,
+    STAGE18_RIGHT_1, STAGE18_BACK_1, STAGE18_TURN_1, STAGE18_BACK_2, STAGE18_WALL_BACK_1, STAGE18_WALL_LEFT_1,
+    STAGE20_RIGHT_1, STAGE20_FORWARD_1, STAGE20_WALL_RIGHT_1,
+    STAGE22_LEFT_1, STAGE22_TURN_1, STAGE22_WALL_FORWARD_1, STAGE22_LEFT_2, STAGE22_WALL_LEFT_1,
+    STAGE24_RIGHT_1, STAGE24_BACK_1, STAGE24_TURN_1, STAGE24_WALL_RIGHT_1,
+    STAGE26_LEFT_1, STAGE26_ABS_X, STAGE26_TURN_1, STAGE26_FORWARD_1, STAGE26_WALL_LEFT_1,
+    STAGE28_RIGHT_1, STAGE28_BACK_1, STAGE28_TURN_1, STAGE28_BACK_2, STAGE28_WALL_BACK_1, STAGE28_WALL_LEFT_1,
+    FIRST_SECTION_PASSES, REPLACE_STILL_SECONDS,
+    BUILD_OFFSET_SPEED, PASS2_EXTRA_FORWARD, PASS3_EXTRA_BACKWARD,
+    RESET_REST_WAIT_SECONDS, REST_VEL_THRESH, REST_STILL_HOLD_S
+)
+
+# ==================== 视觉通信客户端 ====================
+
+vision_data = {
+    "purple": {"found": False, "aligned": False, "eu": 0.0, "ev": 0.0},
+    "orange_low": {"found": False, "aligned": False, "eu": 0.0, "ev": 0.0},
+    "orange_high": {"found": False, "aligned": False, "eu": 0.0, "ev": 0.0}
+}
+vision_lock = threading.Lock()
+vision_connected = False
+vision_socket = None
+current_camera = None
+
+def set_camera(camera_type):
+    global current_camera
+    if current_camera != camera_type:
+        print(f"[视觉] 准备切换到 {camera_type} 摄像头...")
+        if vision_socket is not None:
+            try:
+                import json
+                msg = json.dumps({"cmd": "switch_camera", "camera": camera_type}) + "\n"
+                vision_socket.sendall(msg.encode('utf-8'))
+            except Exception as e:
+                print(f"[警告] 切换摄像头命令发送失败: {e}")
+        print(f"[视觉] 切换命令已发送，等待 1.5 秒预热...")
+        import time
+        time.sleep(1.5)
+        current_camera = camera_type
+
+
+
+def vision_client_thread():
+    """后台线程：持续连接香橙派 TCP Server，异步更新多目标视觉数据。"""
+    global vision_connected, vision_data, vision_socket
+    while True:
+        try:
+            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client.connect((VISION_SERVER_IP, VISION_SERVER_PORT))
+            vision_socket = client
+            vision_connected = True
+            print(f"[通信] 成功连接到香橙派视觉节点 {VISION_SERVER_IP}:{VISION_SERVER_PORT}")
+
+            buffer = ""
+            while True:
+                data = client.recv(1024)
+                if not data:
+                    break
+                buffer += data.decode("utf-8", errors="ignore")
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                        with vision_lock:
+                            for key in ["purple", "orange_low", "orange_high"]:
+                                if key in msg:
+                                    vision_data[key]["found"] = msg[key].get("found", False)
+                                    vision_data[key]["aligned"] = msg[key].get("aligned", False)
+                                    vision_data[key]["eu"] = msg[key].get("eu", 0.0)
+                                    vision_data[key]["ev"] = msg[key].get("ev", 0.0)
+                    except Exception:
+                        pass
+        except Exception as e:
+            if vision_connected:
+                print(f"[通信] 视觉节点连接断开: {e}，尝试重连...")
+            vision_connected = False
+        time.sleep(1.0)
+
+
+# ==================== 链路看门狗 ====================
+
+# 链路中断后最多等待多久尝试原地恢复。观察到的 nanoUART 重新枚举约需 1~2 s，
+# 留 20 s 余量足够覆盖 U 口重新枚举 + 重新握手；超时就判定本轮不可续，明确中止。
+LINK_WAIT_TIMEOUT_S = 20.0
+
+# 视觉前进/后退段的「无进展」保护：位置在 GRAB_NO_PROGRESS_S 秒内增长不足
+# GRAB_NO_PROGRESS_EPS 米，就认定卡住并中止。GRAB_SPEED=0.05 m/s 时正常每 0.1 s
+# 就该涨过 eps，3 秒是 30 倍余量；而 3 秒最多多走 0.15 m，止得住。
+GRAB_NO_PROGRESS_EPS = 0.005
+GRAB_NO_PROGRESS_S = 3.0
+
+# 抓走一块之后要重新找下一块时，先等视觉放开对上一个目标的锁定，最多等这么久。
+# 抓取那一刻画面刚发生变化，vision_data 里可能还留着「块还在、且已对齐」的旧帧；
+# 而 CONFIRM=1 一帧就能让 detect_move 原地返回 aligned —— 车一步没动就去抓，
+# 等于没重新定位，且日志和真检测长得一模一样。等释放通常只要几十毫秒。
+GRAB_LOCK_RELEASE_TIMEOUT_S = 2.0
+
+# 原地转弯的「无进展」保护：正常转弯时 rel_yaw 一直在变，1.5 s 内变化不足
+# TURN_NO_PROGRESS_EPS 弧度（≈1.1°）就认定闭环失效/车被卡住，立即停车中止 ——
+# 否则 motion_state 永远不会变 2，车会在原地无反馈地一直转。
+TURN_NO_PROGRESS_EPS = 0.02
+TURN_NO_PROGRESS_S = 1.5
+
+# 转弯**超时**或**航向停滞后**，用陀螺仪实测转角自行判定是否放行：偏差在 10° 内认为
+# A 板其实已转到位、只是到位应答（motion_state=2）没收到；超出则航向不可信，中止本轮。
+# 两条路径共用它 —— 航向停住和超时是同一种故障的两个面孔，判定标准必须一致。
+TURN_VERIFY_TOL_DEG = 10.0
+
+# 直线段的行程上限：允许「实际路程 = 应走位移 × MARGIN + SLACK」。
+# 正常段的路程只会略大于应走位移（减速滑行 ≤DECEL，加一点横向漂移），
+# 1.5/0.3 留了足够余量；只有航向错了才会撞上这条线（那时被追踪的轴几乎不动，
+# 而真实路程一直在涨）。取 1.5/0.3 意味着 2.0m 的段最多跑 3.3m 就停。
+LINE_PATH_MARGIN = 1.5
+LINE_PATH_SLACK = 0.3
+
+# 撞墙段的硬超时兜底。按最长的橙块段算（WALL_ORANGE_MAX=1.40 / DECEL=1.30 /
+# END_SPEED=0.10，起步 VEL=0.60）：前 1.30m 匀减速平均 0.35 m/s 用 3.7s，剩 0.10m
+# 以 0.10 m/s 爬 1.0s，合计约 4.7s。10s 有 2 倍余量；超时说明真的卡住了。
+WALL_HIT_TIMEOUT_S = 10.0
+
+
+class MissionAbort(RuntimeError):
+    """流程无法安全继续，必须中止本轮。"""
+
+
+class ChassisLinkLost(MissionAbort):
+    """A 板串口链路断开或遥测停摆且无法原地恢复，当前动作不可能继续。"""
+
+
+class BaselineResetFailed(MissionAbort):
+    """撞墙后的基准零点重置未获确认，后续按绝对坐标规划的段全部不可信。
+
+    2026-10-03 起 `run_wall_hit` **不再抛它**：改成打印明确的偏移量警告后继续跑
+    （操作员决定）。保留这个类型是为了以后想恢复「基准不对就断」时有现成的语义。
+    """
+
+
+_active_chassis = None   # main() 建好底盘后登记，供顶层异常处理停车并释放串口
+
+
+def check_link(chassis, stage="", resume_ok=True, require_armed=True):
+    """链路看门狗：链路中断**或遥测停摆**时立即停车并尝试恢复；恢复不了就抛出中止流程。
+
+    为什么需要它：A 板链路走的是 MuseLab nanoUART 这颗 USB 桥。树莓派供电欠压时它会
+    周期性重新枚举（dmesg 里 1-1.1 反复 disconnect/re-enum）；此外 A 板自身也可能只是
+    停止应答。旧的代码在这种情况下只把 connection_ready 置假、读线程退出，而各动作
+    循环仍在拿**冻结的里程计**空转。
+
+    触发条件有两条，缺一不可 —— 2026-10-03 实机就是栽在只判了第一条：
+
+      * `link_lost`       —— 串口读/写抛异常，USB 设备掉了。
+      * `telemetry_lost`  —— 串口还开着，但 A 板连续 >2 s 一帧 odom 都不发。
+        这时**所有依赖里程计的退出条件都会永久失效**：`traveled >= max_dist` 永远不
+        成立；堵转判定的 `vel_now = |vx|+|vy|+|wz|` 又一直读到冻结前的旧值（车当时
+        还在动，故非零），于是「车在动」恒为真，堵转也永远判不出来。结果就是动作卡死，
+        只能等硬编码超时，之后还带着假零点继续往下跑。
+
+    恢复策略见 ChassisDriver.try_reconnect()：
+      * 只是 USB 桥复位、A 板没掉电 → 里程计与 ARMED 状态都还在，跳过 odom_reset 原地续跑；
+      * A 板本身重启或死机 → 握手拿不到 ACK，判定不可续，中止本轮。
+    """
+    if getattr(chassis, "simulate", False):
+        return
+
+    link_lost = getattr(chassis, "link_lost", False)
+    telemetry_stale = getattr(chassis, "telemetry_lost", False)
+    if not (link_lost or telemetry_stale):
+        return          # 链路与遥测都健康；首次握手尚未完成也不归本看门狗管
+
+    where = f"（{stage}）" if stage else ""
+    reason = "串口中断" if link_lost else "遥测停摆（连续 >2s 无 odom，里程计已不可信）"
+    print(f"\n[链路] ⚠ A 板{reason}{where}，立即停车，尝试恢复...")
+    try:
+        chassis.stop()
+    except Exception:
+        pass
+
+    if chassis.try_reconnect(LINK_WAIT_TIMEOUT_S, require_armed=require_armed):
+        if resume_ok:
+            print(f"[链路] ✓ 链路已恢复，继续执行{stage or '当前动作'}。")
+            return
+        # 转弯是 A 板闭环动作，链路一断就被板端取消了；就算链路恢复，
+        # 已转过的角度也不可信，绝不能带着错误航向继续往下走。
+        raise ChassisLinkLost(
+            f"A 板{reason}{where}：转弯属于板端闭环动作，中途中断后航向不可信，本轮中止"
+        )
+
+    raise ChassisLinkLost(f"A 板{reason}{where}且无法原地恢复")
+
+
+# ==================== 原地旋转执行器 ====================
+
+def run_turn_segment(chassis, seg):
+    """执行一次原地旋转，使用 A 板 move,0,0,dyaw 陀螺仪硬件闭环。"""
+    angle_deg = seg["angle_deg"]
+    dyaw = angle_deg * math.pi / 180.0
+
+    print(f"  执行转弯: {seg['name']} (dyaw={dyaw:+.3f} rad, {angle_deg:+.1f}°)")
+
+    chassis.poll()                       # 先刷新一帧，确保 yaw_start 是当前读数
+    yaw_start = chassis.odom_data["rel_yaw"]
+    chassis.send_command(format_move_cmd(0.0, 0.0, dyaw))
+
+    t0 = time.monotonic()
+    last_progress_at = t0
+    last_yaw = yaw_start
+    reached = False
+    # 陈旧帧防护 —— 2026-10-03 实机栽在这里。
+    # 发完 move 之后，接收队列里往往还压着上一段留下的旧帧（甚至就是上一段的
+    # stop 回显），其 motion_state 仍是 COMPLETE(2)。老代码不看这一点，循环第一轮
+    # 就判「已到位」退出：日志里打印「当前航向角 = +0.1°」（根本没转过），而 A 板
+    # 真正的 move:ok 在 3 行之后才到 —— 车确实转了，是上位机没等。接着下一段按
+    # 错误航向直行，rel_x 永远到不了 target，而那段循环没有超时保护，于是车以
+    # 0.6 m/s 一直直行不停，最后只能急停断电。
+    # 修正：COMPLETE 帧只有在**本次动作确实已经开始**之后才可信。两个判据取或 ——
+    # 见过 RUNNING(1)，或陀螺仪实测已经转过 TURN_NO_PROGRESS_EPS。陈旧帧两者都不满足。
+    started = False
+    while time.monotonic() - t0 < TURN_TIMEOUT:
+        chassis.poll()
+        chassis.maintain()
+        check_link(chassis, seg["name"], resume_ok=False)
+        od = chassis.odom_data
+
+        if od["motion_state"] == 1:
+            started = True
+
+        # 无进展保护：转弯是 A 板陀螺仪闭环动作，正常情况下 rel_yaw 一直在变。
+        # 若 1.5 s 内航向几乎不动，说明闭环失效或车被卡住 —— 此时 motion_state
+        # 永远不会变成 2，光靠 TURN_TIMEOUT 兜底会让车在原地无反馈地空转。
+        #
+        # 但「航向停住」不等于「转弯失败」—— 2026-10-03 实机就冤杀了一次：
+        #     [RX] move:ok
+        #     【本轮中止】原地右转 90.0 度：1.5s 内航向角几乎没变 (Δyaw=-89.1°，目标 -90.0°)
+        # Δyaw=-89.1° 离目标只差 0.9°，属于正常到位精度，可板端判 COMPLETE 的容差
+        # yaw_tol 是 0.0157 rad（0.9°）—— 恰好差一点点进不去，板端于是保持 RUNNING，
+        # 只输出 wz = 0.0157×2.0 ≈ 0.031 rad/s 这种推不动电机的速度，航向就冻结了。
+        # 车其实停在了正确的位置上，是上位机把它判成了故障。
+        # 修正：停车中止前，先做一次**和下面 TURN_TIMEOUT 分支完全一样**的陀螺仪
+        # 复核 —— 实测转角落在 TURN_VERIFY_TOL_DEG 内就认它到位、继续走；
+        # 只有真的转得离谱才中止。
+        if abs(od["rel_yaw"] - last_yaw) > TURN_NO_PROGRESS_EPS:
+            last_yaw = od["rel_yaw"]
+            last_progress_at = time.monotonic()
+        elif time.monotonic() - last_progress_at > TURN_NO_PROGRESS_S:
+            delta_deg = (od["rel_yaw"] - yaw_start) * 57.2958
+            if abs(delta_deg - angle_deg) <= TURN_VERIFY_TOL_DEG:
+                print(f"  [警告] {TURN_NO_PROGRESS_S:.1f}s 内航向未再变化，但实测转角 "
+                      f"{delta_deg:+.1f}° 已在 {TURN_VERIFY_TOL_DEG:.0f}° 容差内"
+                      f"（目标 {angle_deg:+.1f}°），判定已转到位，继续。")
+                reached = True
+                break
+            chassis.stop()
+            raise MissionAbort(
+                f"{seg['name']}：{TURN_NO_PROGRESS_S:.1f}s 内航向角几乎没变 "
+                f"(Δyaw={delta_deg:+.1f}°，目标 {angle_deg:+.1f}°，偏差 "
+                f"{delta_deg - angle_deg:+.1f}° 超出 {TURN_VERIFY_TOL_DEG:.0f}° 容差)，"
+                f"已停车中止本轮。多半是陀螺仪闭环失效或车被卡住。"
+            )
+
+        turned = abs(od["rel_yaw"] - yaw_start) > TURN_NO_PROGRESS_EPS
+        if od["motion_state"] == 2 and (started or turned):
+            print(f"  转弯到位: 当前航向角 = {od['rel_yaw'] * 57.2958:+.1f}°")
+            reached = True
+            break
+        time.sleep(0.03)
+
+    if not reached:
+        chassis.stop()
+        # 超时不等于失败：A 板可能已经转到位、只是到位应答没收到。用陀螺仪实测的
+        # 转角自己判一次 —— 偏差在容差内就放行，否则航向已不可信，必须中止。
+        delta_deg = (chassis.odom_data["rel_yaw"] - yaw_start) * 57.2958
+        err_deg = delta_deg - angle_deg
+        if abs(err_deg) <= TURN_VERIFY_TOL_DEG:
+            print(f"  [警告] 转弯超时 ({TURN_TIMEOUT}s) 未收到到位应答，"
+                  f"但实测转角 {delta_deg:+.1f}° 已在 {TURN_VERIFY_TOL_DEG:.0f}° 容差内，继续。")
+        else:
+            raise MissionAbort(
+                f"{seg['name']}：转弯超时 ({TURN_TIMEOUT}s)，实测转角 {delta_deg:+.1f}°，"
+                f"目标 {angle_deg:+.1f}°，偏差 {err_deg:+.1f}° 超出 {TURN_VERIFY_TOL_DEG:.0f}° 容差。"
+                f"航向不可信，后续按绝对坐标规划的段会全部走偏，本轮中止。"
+            )
+
+    time.sleep(TURN_SETTLE)
+
+
+# ==================== 路线巡航通用器 ====================
+def blend(chassis, vx_f, vy_f, vx_t, vy_t, name):
+    print(f"[混合] {name}（{BLEND_STEPS} 步）")
+    for i in range(1, BLEND_STEPS + 1):
+        s = i / BLEND_STEPS
+        chassis.set_velocity(vx_f * (1.0 - s) + vx_t * s,
+                             vy_f * (1.0 - s) + vy_t * s, 0.0)
+        chassis.poll()
+        chassis.maintain()
+        check_link(chassis, f"混合转向 {name}")
+        time.sleep(0.03)
+
+def run_segments_sequence(chassis, segments_list, name="路线巡航", end_blend_vy=0.0):
+    if not segments_list:
+        return
+    print(f"\n{'='*50}")
+    print(f"  开始{name}（共 {len(segments_list)} 段）")
+    print(f"{'='*50}")
+
+    slow_factor = SLOW / VEL
+    for idx, seg in enumerate(segments_list):
+        seg_type = seg.get("type", "line")
+        print(f"\n[路段 {idx + 1}/{len(segments_list)}] {seg['name']}")
+
+        if seg_type == "line":
+            vx, vy = seg["vx"] * VEL, seg["vy"] * VEL
+            axis, target, direction = seg["axis"], seg["target"], seg["dir"]
+            chassis.set_velocity(vx, vy, 0.0)
+
+            # 行程上限保护。这个循环原来只有 check_link 一道守卫，而它只在链路/遥测
+            # 断了的时候才触发 —— 遥测健康但**航向不对**时，被追踪的那根轴
+            # （rel_x 或 rel_y）根本到不了 target，循环就永远不退出，车以 VEL 一直
+            # 直行。2026-10-03 实机：转弯被误判成功后车头摆着，直行 2.0m 这一段
+            # 跑成了无限直行，只能急停断电。
+            # 判据用「实际走过的路程」而不是被追踪的那根轴：航向错了的时候，恰恰是
+            # 被追踪的轴不动、而真实路程一直在涨。
+            x_start = chassis.odom_data["rel_x"]
+            y_start = chassis.odom_data["rel_y"]
+            val_start = x_start if axis == "x" else y_start
+            dist_limit = abs(target - val_start) * LINE_PATH_MARGIN + LINE_PATH_SLACK
+            print(f"    [保护] 本段实际路程上限 {dist_limit:.2f}m")
+
+            while True:
+                chassis.poll()
+                chassis.maintain()
+                check_link(chassis, seg["name"])
+                od = chassis.odom_data
+                val = od["rel_x"] if axis == "x" else od["rel_y"]
+
+                path = math.hypot(od["rel_x"] - x_start, od["rel_y"] - y_start)
+                if path > dist_limit:
+                    chassis.stop()
+                    raise MissionAbort(
+                        f"{seg['name']}：实际已走 {path:.2f}m，超过本段上限 {dist_limit:.2f}m，"
+                        f"但 {axis} 只到 {val:+.3f}（目标 {target:+.3f}）。多半是上一步航向"
+                        f"不对或里程计异常，已停车中止本轮。"
+                    )
+
+                if abs(target - val) <= DECEL:
+                    chassis.set_velocity(vx * slow_factor, vy * slow_factor, 0.0)
+                if (val - target) * direction >= 0:
+                    break
+                # print(f"val={val}, target={target}, vx={vx}, vy={vy}")
+                time.sleep(0.02)
+            
+            if idx + 1 < len(segments_list):
+                nxt = segments_list[idx + 1]
+                if nxt.get("type", "line") == "line":
+                    blend(chassis, vx * slow_factor, vy * slow_factor,
+                          nxt["vx"] * VEL, nxt["vy"] * VEL,
+                          f"{seg['name']} → {nxt['name']}")
+                else:
+                    chassis.stop()
+                    time.sleep(0.05)
+            elif end_blend_vy != 0.0:
+                blend(chassis, vx * slow_factor, vy * slow_factor, 0.0, end_blend_vy, f"{seg['name']} → 左移撞墙")
+            else:
+                chassis.stop()
+                time.sleep(0.05)
+
+        elif seg_type == "turn":
+            run_turn_segment(chassis, seg)
+        else:
+            print(f"  [警告] 未知路段类型 '{seg_type}'，跳过")
+
+    print(f"\n{'='*50}")
+    print(f"  {name}完成")
+    print(f"{'='*50}")
+
+
+# ==================== 撞墙通用逻辑 ====================
+
+def run_wall_hit(chassis, hit_vx, hit_vy, max_dist, end_speed, decel_dist, vel_thresh, pos_thresh, stall_time, label="", track_axis=None, track_dir=None, reset_odom=True):
+    print(f"\n[撞墙段] {label}（最大 {max_dist:.2f}m，堵转 {stall_time}s，撞墙即停）")
+
+    # 减速斜坡的行程不能超过本段的行程上限。
+    # 斜坡的定义是「走过 decel_dist 时速度正好降到 end_speed」：
+    #     v_ratio = 1 - traveled/decel_dist
+    # decel_dist > max_dist 时这个斜坡永远走不完，车以「还没降到 end_speed」的速度
+    # 撞上行程上限就结束了。实机证据：config 里 WALL_BUILD_DECEL_DIST = 0.60 被一批
+    # 0.30m 的短撞墙段复用（阶段18/22/28 等），0.30m 处 v_ratio 才到 0.5，车速
+    # 0.35 m/s 就顶上去，end_speed 0.10 形同虚设，末端也更容易把方块撞飞。
+    # 夹到 max_dist 后，斜坡恰好铺满整段：起步 VEL，到上限时正好 end_speed。
+    if decel_dist > max_dist:
+        print(f"[撞墙段] ⚠ {label} 的减速距离 {decel_dist:.2f}m 超过行程上限 "
+              f"{max_dist:.2f}m，已夹到 {max_dist:.2f}m（否则末端速度降不下来）")
+        decel_dist = max_dist
+
+    chassis.stop()
+    time.sleep(0.2)
+    chassis.send_command("contact_enable,0")
+    chassis.send_command("heading_hold,0")
+    time.sleep(0.5)
+
+    chassis.poll()
+    start_x = chassis.odom_data["rel_x"]
+    start_y = chassis.odom_data["rel_y"]
+    stall_since = None
+    stall_ref = None
+    contacted = False        # 三种退出里只有「堵转」才算真的碰到墙
+    t_wall = time.monotonic()
+
+    # 说明：track_axis / track_dir 两个参数保留在签名里（阶段 11~29 的调用点仍在
+    # 按关键字传参），但**测距不再依赖它们**，原因见下面 traveled 的算法。
+
+    while True:
+        chassis.poll()
+        check_link(chassis, f"撞墙段 {label}")
+        od = chassis.odom_data
+
+        # 用位移模长测距，不用单轴投影。
+        # 2026-10-03 实机跑飞（搭建区，TX vy 从 0.600 爬到 0.822 后失控）：原来写的是
+        #     traveled = (rel_x 或 rel_y - start_val) * direction
+        # direction 是从 (hit_vx, hit_vy) 推出来的 —— 那是**车身系**命令，而 rel_x/rel_y
+        # 是**里程计系**。车头转过 90° 后两者差一个旋转（搭建区前已转两次 -90°，车头
+        # ≈ -177°），此时身体 +y 实际对应世界 -Y，rel_y 在减小而 direction 假定 +1，
+        # 于是 traveled 变负 → v_ratio > 1 → 减速斜坡反相成加速斜坡（0.6 越跑越快），
+        # 同时 traveled >= max_dist 永不成立，0.50m 的行程上限一并失效，只剩 10s 超时。
+        # hypot 恒 >= 0 且与车头朝向无关，三个调用点都不必各自去算朝向。
+        traveled = math.hypot(od["rel_x"] - start_x, od["rel_y"] - start_y)
+
+        if traveled < decel_dist:
+            v_ratio = 1.0 - (traveled / decel_dist)
+        else:
+            v_ratio = 0.0
+        v_ratio = min(1.0, max(0.0, v_ratio))
+        current_speed = end_speed + (VEL - end_speed) * v_ratio
+        # 双重保险：v_ratio 已夹在 [0,1]，这里再把速度硬夹在 [end_speed, VEL]，
+        # 保证任何异常里程计都不可能让撞墙段超速。
+        current_speed = min(VEL, max(end_speed, current_speed))
+
+        norm = math.hypot(hit_vx, hit_vy)
+        if norm > 0:
+            set_vx = (hit_vx / norm) * current_speed
+            set_vy = (hit_vy / norm) * current_speed
+        else:
+            set_vx, set_vy = 0.0, 0.0
+
+        chassis.set_velocity(set_vx, set_vy, 0.0)
+        chassis.maintain()
+
+        if traveled >= max_dist:
+            chassis.stop()
+            print(f"[撞墙段] {label}走完 {max_dist:.2f}m，未碰墙")
+            break
+
+        vel_now = abs(od["vx"]) + abs(od["vy"]) + abs(od["wz"])
+        if vel_now < vel_thresh:
+            if stall_since is None:
+                stall_since = time.monotonic()
+                stall_ref = (od["rel_x"], od["rel_y"])
+            else:
+                moved = (abs(od["rel_x"] - stall_ref[0]) + abs(od["rel_y"] - stall_ref[1]))
+                if moved > pos_thresh:
+                    stall_since = time.monotonic()
+                    stall_ref = (od["rel_x"], od["rel_y"])
+                elif time.monotonic() - stall_since >= stall_time:
+                    chassis.stop()
+                    contacted = True
+                    print(f"[撞墙] 检测到堵转（碰墙），已停车，位移 {traveled:.3f}m")
+                    break
+        else:
+            stall_since = None
+            stall_ref = None
+
+        if time.monotonic() - t_wall > WALL_HIT_TIMEOUT_S:
+            print(f"[撞墙段] 超时（{WALL_HIT_TIMEOUT_S:.0f}s），未确认碰墙")
+            chassis.stop()
+            break
+        time.sleep(0.02)
+
+    if not contacted:
+        # 没碰到墙 ≠ 可以当没发生过。下面照样会重置零点（把基准锚在「最近一个已知
+        # 位置」，总比锚在几米外的上一个撞墙点强），但必须把风险说出来：本段之后
+        # 所有按绝对坐标规划的 SEGMENTS_* 都会带着「差多少没顶到墙」这个未知偏差，
+        # 而且下游的视觉抓取段是从一个离方块更远的位置起测的。
+        # 2026-10-03 实机：紫块段走完 0.30m 未碰墙，紧跟着的「找紫块前进 0.60m」
+        # 也报 [超距] 未检测到 —— 这一串很可能就是从这里开始的。
+        print(f"[撞墙段] ⚠ {label}：走了 {traveled:.2f}m（上限 {max_dist:.2f}m）仍未检测到"
+              f"碰墙。车没顶到墙面，下面重置出来的基准点**不是**真实的撞墙位置。"
+              f"多半是这一段的 WALL_*_MAX 给小了，或现场有东西把车挡住了，请核对。")
+
+    chassis.poll()
+    if reset_odom:
+        print(f"\n[基准重置] {label}完成，将当前物理位姿重置为绝对基准原点 (0,0,0)...")
+        if chassis.reset_odometry():
+            print("[基准重置] A 板里程计重置成功！")
+        else:
+            # 曾经这里是 raise BaselineResetFailed（基准没确认就不许往下跑）。2026-10-03
+            # 实机后改成「报警告继续」：odom_reset 曾因为被 stop 的清队列吃掉而谎报成功，
+            # 那次直接把后面 阶段7 的 0.2m 平移整段吞掉了 —— 与其在撞墙点终结整轮，
+            # 不如把偏移量明确打出来，让操作员自己判断这一轮还能不能用。
+            # 重发+遥测复核已经在 ChassisDriver.reset_odometry 里做足了，走到这里
+            # 是真的 20 次都没成，不要再用假的 (0,0,0) 掩盖。
+            od = chassis.odom_data
+            print(f"[基准重置] ⚠ {label} 之后 A 板未能确认归零"
+                  f"（当前 X={od['rel_x']:+.3f} Y={od['rel_y']:+.3f} "
+                  f"Yaw={od['rel_yaw'] * 57.3:+.1f}°）。按操作员决定继续往下跑，"
+                  f"但后续 SEGMENTS_* 的绝对目标会带着这个偏移量。")
+    else:
+        print(f"\n[基准保留] {label}完成，不重置零点。当前位姿: X={chassis.odom_data['rel_x']:.3f}, Y={chassis.odom_data['rel_y']:.3f}, Yaw={chassis.odom_data['rel_yaw']*57.3:.1f}°")
+        
+    chassis.send_command("heading_hold,1")
+    time.sleep(0.2)
+    chassis.poll()
+
+
+# ==================== 视觉巡线停车 ====================
+
+def detect_move(chassis, vx, dist, label, target_type="purple", camera_type="low"):
+    """以 vx 速度移动并检测，落入椭圆就停车。"""
+    set_camera(camera_type)
+    chassis.poll()
+    x_start = chassis.odom_data["rel_x"]
+    y_start = chassis.odom_data["rel_y"]
+    aligned_count = 0
+    chassis.set_velocity(vx, 0.0, 0.0)
+
+    # 无进展保护：odom 正常时位置一直在涨；一旦长时间不涨，说明要么顶住障碍打滑，
+    # 要么里程计已失效而 telemetry_lost 还没来得及置位。没有这道保护时
+    # `abs(dist_moved) >= dist` 永远不成立，车会顶着障碍物一直往前推（2026-10-03 实机）。
+    last_progress_at = time.monotonic()
+    last_abs_dist = 0.0
+
+    while True:
+        chassis.poll()
+        chassis.maintain()
+        check_link(chassis, label)
+
+        with vision_lock:
+            found = vision_data[target_type]["found"]
+            aligned_now = vision_data[target_type]["aligned"]
+            eu = vision_data[target_type]["eu"]
+            ev = vision_data[target_type]["ev"]
+
+        current_x = chassis.odom_data["rel_x"]
+        current_y = chassis.odom_data["rel_y"]
+        
+        dist_moved = math.hypot(current_x - x_start, current_y - y_start)
+        if vx < 0:
+            dist_moved = -dist_moved
+
+        if abs(dist_moved) - last_abs_dist > GRAB_NO_PROGRESS_EPS:
+            last_abs_dist = abs(dist_moved)
+            last_progress_at = time.monotonic()
+
+        if found and aligned_now:
+            aligned_count += 1
+            if aligned_count >= CONFIRM:
+                chassis.stop()
+                print(f"[对齐] {label}中目标已落入椭圆 (u={eu:+.1f}, v={ev:+.1f})，已停车")
+                print(f"[位移] {label}微调位移 ΔD = {dist_moved:+.4f}m")
+                return "aligned", eu, ev, dist_moved, current_x, current_y
+        else:
+            aligned_count = 0
+
+        if abs(dist_moved) >= dist:
+            chassis.stop()
+            print(f"[超距] {label} {dist:.2f}m 未检测到 (实际走过 = {dist_moved:+.4f}m)")
+            return "timeout", 0.0, 0.0, dist_moved, current_x, current_y
+
+        if time.monotonic() - last_progress_at > GRAB_NO_PROGRESS_S:
+            chassis.stop()
+            raise MissionAbort(
+                f"{label}：{GRAB_NO_PROGRESS_S:.0f}s 内位置几乎没变（ΔD={dist_moved:+.4f}m），"
+                f"已停车中止本轮。多半是顶住障碍物打滑，或里程计已失效。"
+            )
+
+        time.sleep(0.02)
+
+
+def _wait_lock_release(target_type, timeout_s=GRAB_LOCK_RELEASE_TIMEOUT_S):
+    """等视觉放开对上一个目标的锁定，返回是否等到了。
+
+    抓走一块之后画面刚刚变过，vision_data 里可能还留着「块还在、且已经对齐」的
+    旧帧；而 CONFIRM=1 一帧就能让 detect_move 原地返回 aligned —— 车一步没动就
+    去抓下一块，等于根本没重新定位，而且日志和真检测打印得一模一样，看不出来。
+
+    这里等 (found and aligned) 先变成 False，也就是「视觉承认自己不再锁定目标了」。
+    真目标确实就在眼前时这个条件不会满足，等满 timeout_s 后照常继续 —— 最坏只是
+    慢这 2 秒，不会让任何一次本该成功的检测失败。
+    """
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout_s:
+        with vision_lock:
+            locked = (vision_data[target_type]["found"]
+                      and vision_data[target_type]["aligned"])
+        if not locked:
+            print(f"[视觉] 上一个目标锁定已释放 (等待 {time.monotonic() - t0:.2f}s)")
+            return True
+        time.sleep(0.02)
+    print(f"[视觉] 警告：等了 {timeout_s:.1f}s 目标锁定仍未释放，仍继续检测")
+    return False
+
+
+def find_orange_block(chassis, tag, max_dist=None):
+    """前进检测橙块，未检测到就后退同样距离再检测一遍。
+
+    阶段 7 要连找两块（抓走第一块后从当前位置重新找第二块），两处流程完全一样，
+    抽出来避免 6 元组解包的样板写两遍。
+    """
+    max_dist = GRAB_MAX if max_dist is None else max_dist
+    r = detect_move(chassis, GRAB_SPEED, max_dist, f"{tag}前进",
+                    target_type="orange_low", camera_type="low")
+    if r[0] == "timeout":
+        r = detect_move(chassis, -GRAB_SPEED, max_dist, f"{tag}后退",
+                        target_type="orange_low", camera_type="low")
+    return r
+
+
+# ==================== 相对与绝对短途移动工具 ====================
+
+def move_rel(chassis, vx_val, vy_val, dist, name="", speed=VEL):
+    """按车体方向走一段相对位移。
+
+    vx_val/vy_val 只表示方向（一般取 ±1.0），巡航速度默认 VEL；
+    需要慢速微调时用 speed 显式给出 m/s，不要去改 vx_val 硬凑，
+    否则速度会被偷偷绑死在 VEL 的数值上。
+    """
+    chassis.poll()
+    sx, sy = chassis.odom_data["rel_x"], chassis.odom_data["rel_y"]
+    vx_cmd, vy_cmd = vx_val * speed, vy_val * speed
+    chassis.set_velocity(vx_cmd, vy_cmd, 0.0)
+    print(f"\n[相对移动] {name} (目标 {dist:.3f}m @ {speed:.2f}m/s)")
+    slow_factor = SLOW / VEL
+    while True:
+        chassis.poll()
+        chassis.maintain()
+        check_link(chassis, f"相对移动 {name}")
+        od = chassis.odom_data
+        moved = math.hypot(od["rel_x"] - sx, od["rel_y"] - sy)
+        if dist - moved <= DECEL:
+            chassis.set_velocity(vx_cmd * slow_factor, vy_cmd * slow_factor, 0.0)
+        if moved >= dist:
+            break
+        time.sleep(0.02)
+    chassis.stop()
+    time.sleep(0.05)
+
+def move_abs_x(chassis, target_x, name=""):
+    chassis.poll()
+    curr_x = chassis.odom_data["rel_x"]
+    vx_cmd = VEL if target_x > curr_x else -VEL
+    dir_val = 1 if target_x > curr_x else -1
+    chassis.set_velocity(vx_cmd, 0.0, 0.0)
+    print(f"\n[绝对移动] {name} (前往 X={target_x:.3f}m)")
+    slow_factor = SLOW / VEL
+    while True:
+        chassis.poll()
+        chassis.maintain()
+        check_link(chassis, f"绝对移动 {name}")
+        od = chassis.odom_data
+        if abs(target_x - od["rel_x"]) <= DECEL:
+            chassis.set_velocity(vx_cmd * slow_factor, 0.0, 0.0)
+        if (od["rel_x"] - target_x) * dir_val >= 0:
+            break
+        time.sleep(0.02)
+    chassis.stop()
+    time.sleep(0.05)
+
+# ==================== 分段测试支撑 ====================
+
+class OdomTrace:
+    """记录一段动作的起止里程计，用于分段测试时核对「这一段实际走了多少」。
+
+    分段测试的核心诉求就是量位移，所以每段结束打一行 Δx/Δy/Δyaw，
+    不需要再去 run.log 里翻散落的 [路段]/[撞墙] 打印。
+    """
+
+    def __init__(self, chassis, name):
+        chassis.poll()
+        self.name = name
+        self.x0 = chassis.odom_data["rel_x"]
+        self.y0 = chassis.odom_data["rel_y"]
+        self.yaw0 = chassis.odom_data["rel_yaw"]
+
+    def report(self, chassis):
+        chassis.poll()
+        dx = chassis.odom_data["rel_x"] - self.x0
+        dy = chassis.odom_data["rel_y"] - self.y0
+        dyaw = chassis.odom_data["rel_yaw"] - self.yaw0
+        print("\n" + "-" * 60)
+        print(f"[位移核对] {self.name}")
+        print(f"  起点  X={self.x0:+.3f}  Y={self.y0:+.3f}  Yaw={self.yaw0 * 57.2958:+.1f}°")
+        print(f"  终点  X={chassis.odom_data['rel_x']:+.3f}  "
+              f"Y={chassis.odom_data['rel_y']:+.3f}  "
+              f"Yaw={chassis.odom_data['rel_yaw'] * 57.2958:+.1f}°")
+        print(f"  本段位移  ΔX={dx:+.3f} m   ΔY={dy:+.3f} m   ΔYaw={dyaw * 57.2958:+.1f}°")
+        print("-" * 60 + "\n")
+
+
+class MissionState:
+    """跨阶段传递的少量状态。分段测试时用默认值补齐上一段本应算出的量。
+
+    关键默认值（决定了分段测试的起点摆放）：
+      * delta_x_grab = 0.0 —— 阶段 2 开头要「退回紫块抓取的微调位移」。
+        单独测阶段 2 时没有抓过紫块，位移为 0，正好跳过这段回退。
+      * y_orange_start = 0.0 —— 阶段 3 开头要「退回橙色块初始点」。
+        单独测阶段 3 时车就摆在橙块撞墙点、里程计刚在启动握手里清零，
+        该点 Y 即 0，同样正好跳过。
+    """
+
+    def __init__(self):
+        self.res = "quit"            # 阶段 1 的视觉结果
+        self.res2 = "quit"           # 阶段 2 的视觉结果
+        self.delta_x_grab = 0.0      # 紫块抓取的实际微调位移
+        self.x_grab_pos = 0.0
+        self.y_orange_start = 0.0
+
+
+def _start_maintain_thread(chassis):
+    """后台保活线程：A 板需要周期性心跳，长时间等视觉时必须持续 maintain()。"""
+    stop = threading.Event()
+
+    def _loop():
+        while not stop.is_set():
+            chassis.maintain()
+            time.sleep(0.02)
+
+    threading.Thread(target=_loop, daemon=True).start()
+    return stop
+
+
+# ==================== 分段测试 1/3：抓取紫色块 ====================
+
+def stage1_grab_purple(chassis, arm, state):
+    """阶段 1~6：路线巡航 → 紫块撞墙定位 → 视觉微调 → 机械臂 Id1 抓紫块。
+
+    起点：车停在本阶段路线的起点。程序启动时握手已把此处记为原点 (0,0,0)。
+    终点：紫块已入左侧框；紫块撞墙处已被设为新的绝对基准原点。
+    """
+    print("\n" + "=" * 60)
+    print("  【分段测试 1/3】抓取紫色块")
+    print("  起点要求：车摆在本阶段巡航路线的起点")
+    print("=" * 60)
+
+    trace = OdomTrace(chassis, "阶段1 抓紫块（从路线起点算起）")
+
+    # ---------- 路线巡航（直线 + 转弯，每段之间停稳） ----------
+    try:
+        run_segments_sequence(chassis, SEGMENTS, name="路线巡航", end_blend_vy=VEL)
+
+        # ---------- 紫块撞墙定位 ----------
+        run_wall_hit(chassis, 0.0, VEL, WALL_PURPLE_MAX, WALL_PURPLE_END_SPEED,
+                     WALL_PURPLE_DECEL_DIST, WALL_PURPLE_VEL_THRESH,
+                     WALL_PURPLE_POS_THRESH, WALL_PURPLE_STALL_TIME, "紫块左移撞墙")
+    except KeyboardInterrupt:
+        print("\n[急停] Ctrl+C")
+        chassis.stop()
+
+    # ---------- 视觉抓取微调 (紫块) ----------
+    maintain_stop = _start_maintain_thread(chassis)
+
+    print(f"[视觉] 前进检测，最多 {GRAB_MAX:.2f}m；未检测到则后退重新检测")
+    res = "quit"
+    try:
+        res, eu, ev, dx, curr_x, curr_y = detect_move(
+            chassis, GRAB_SPEED, GRAB_MAX, "找紫块前进",
+            target_type="purple", camera_type="low")
+        state.delta_x_grab += dx
+        state.x_grab_pos = curr_x
+        if res == "timeout":
+            res, eu, ev, dx, curr_x, curr_y = detect_move(
+                chassis, -GRAB_SPEED, GRAB_MAX, "找紫块后退",
+                target_type="purple", camera_type="low")
+            state.delta_x_grab += dx
+            state.x_grab_pos = curr_x
+    except KeyboardInterrupt:
+        print("\n[急停] Ctrl+C")
+        chassis.stop()
+        res = "quit"
+    finally:
+        maintain_stop.set()
+
+    state.res = res
+    aligned = (res == "aligned")
+
+    if aligned:
+        chassis.poll()
+        print("\n" + "=" * 60)
+        print("【高精定位分析】紫色方块抓取点位姿校准完成：")
+        print(f"  · 视觉对齐后实际抓取位:   X = {state.x_grab_pos:.4f} m, "
+              f"Y = {chassis.odom_data['rel_y']:.4f} m")
+        print(f"  · 真实微调纠偏位移 (ΔD):  {state.delta_x_grab:+.4f} m "
+              f"({state.delta_x_grab * 1000:+.1f} mm)")
+        print("=" * 60 + "\n")
+
+    # ---------- 机械臂抓取 Id1 (紫块) ----------
+    if aligned and arm is not None:
+        print("[抓取] 调用机械臂 Id1（抓紫色块放左框）")
+        arm.play_action(ID1_XML)
+        print("[抓取] Id1 完成")
+        arm.unload()
+        print("[卸力] 舵机已失能节能")
+    elif aligned:
+        print("[跳过抓取] 机械臂未连接")
+    else:
+        # 识别不到就跳过，是**设计好的**路径（detect_move 超距时返回 "timeout" 而不
+        # 抛异常），可老代码在这里一声不吭 —— 日志上「[超距] 找紫块前进…未检测到」
+        # 之后直接跳到阶段 7，看起来像是流程崩了。把它明说出来。
+        print(f"\n[跳过抓取] 未在 {GRAB_MAX:.2f}m 内找到紫色块（结果 = {res}），"
+              f"跳过机械臂 Id1，直接进入后续阶段（回零点 → 远侧橙块 → …）。")
+
+    trace.report(chassis)
+    return res
+
+
+# ==================== 分段测试 2/3：紫块零点 → 橙色块 ====================
+
+def stage2_grab_orange(chassis, arm, state):
+    """阶段 7：退回紫块微调位移 → 前往橙色块区 → 撞墙定位 → 抓两个橙块。
+
+    起点：车摆在**紫块撞墙点**（即紫块阶段结束时的基准原点）。
+    程序启动时握手已把此处记为原点，所以本阶段的绝对坐标段全部对齐。
+    终点：两块橙块已分别放入中间框和右侧框；橙块撞墙处已被设为新原点。
+    """
+    print("\n" + "=" * 50)
+    print("  阶段 7: 返回零点并前往橙色块抓取区")
+    print("=" * 50)
+    print("  【分段测试 2/3】起点要求：车摆在紫块撞墙点")
+
+    trace = OdomTrace(chassis, "阶段2 紫块零点→橙块（从紫块撞墙点算起）")
+
+    # 1. 回到撞墙基准原点 (仅退回抓取紫块前进的实际微调位移)
+    if state.delta_x_grab > 0.005:
+        print(f"[复位] 退回紫块抓取微调前进位移: {state.delta_x_grab:.3f}m")
+        move_rel(chassis, -1.0, 0.0, state.delta_x_grab, "退回紫块抓取位移")
+    elif state.delta_x_grab < -0.005:
+        print(f"[复位] 前进补回紫块微调后退位移: {-state.delta_x_grab:.3f}m")
+        move_rel(chassis, 1.0, 0.0, -state.delta_x_grab, "补回紫块抓取位移")
+    else:
+        print("[复位] 无需复位抓取位移（单独测本段时为 0）")
+
+    # 执行预设的前往橙色块路径（包含平移、旋转、再平移）
+    run_segments_sequence(chassis, SEGMENTS_TO_ORANGE, name="前往橙色块区")
+
+    # 橙色块撞墙定位 (侧移撞墙)
+    run_wall_hit(chassis, 0.0, VEL, WALL_ORANGE_MAX, WALL_ORANGE_END_SPEED,
+                 WALL_ORANGE_DECEL_DIST, WALL_ORANGE_VEL_THRESH,
+                 WALL_ORANGE_POS_THRESH, WALL_ORANGE_STALL_TIME, "橙色块前左移撞墙")
+
+    # 4. 视觉抓取微调找橙色块
+    maintain_stop = _start_maintain_thread(chassis)
+
+    print(f"[视觉] 前进检测第一个橙色块，最多 {GRAB_MAX:.2f}m；未检测到则后退重新检测")
+    res2 = "quit"
+    chassis.poll()
+    state.y_orange_start = chassis.odom_data["rel_y"]   # 记录到达橙色块区域的位置
+
+    try:
+        # 4a. 找第一个橙块
+        res2, eu2, ev2, dx2, cx2, cy2 = find_orange_block(chassis, "找第1个橙块")
+        aligned2 = (res2 == "aligned")
+
+        # 5. 抓第一个橙块（放中间框），然后**从当前位置重新定位**第二个
+        if aligned2 and arm is not None:
+            print("[抓取] 发现橙色块！调用机械臂抓取第一个（放中间框）...")
+            arm.play_action(ID_ORANGE_MID)
+            print("[抓取] 第一个橙色块抓取完成 (中间框)")
+
+            # Id4 的末帧与 Id2/Id1 的首帧完全相同（X=14.40 Y=0.00 Z=8.32
+            # Pitch=-72.5，舵机 130/494/298/287/417/496），就是行驶时的中立位：
+            # 抓完第一块机械臂已经自动收回，保持通电把它摁在收臂位即可安全行车。
+            # 这里刻意不 unload()（卸力会让它从收臂位松垮下来，行车反而危险）。
+            _wait_lock_release("orange_low")
+
+            print(f"[视觉] 从当前位置重新检测第二个橙色块，最多 {GRAB_MAX:.2f}m")
+            res2b = find_orange_block(chassis, "找第2个橙块")[0]
+
+            if res2b == "aligned":
+                print("[抓取] 发现第二个橙色块！调用机械臂抓取（放右侧框）...")
+                arm.play_action(ID2_XML)
+                print("[抓取] 第二个橙色块抓取完成 (右侧框)")
+            else:
+                # 第二次找不到就跳过 Id2 —— 盲抓一个不存在的位置会撞到框/塔。
+                print(f"\n[跳过抓取] 第二次未在 {GRAB_MAX:.2f}m 内找到橙色块"
+                      f"（结果 = {res2b}），跳过 Id2，直接进入后续阶段。")
+
+            arm.unload()
+            print("[卸力] 舵机已失能节能")
+        elif aligned2:
+            print("[跳过抓取] 机械臂未连接")
+        else:
+            # 同阶段 1：识别不到是设计好的跳过路径，但要明确说出来，别让日志像断了。
+            print(f"\n[跳过抓取] 未在 {GRAB_MAX:.2f}m 内找到橙色块（结果 = {res2}），"
+                  f"跳过机械臂抓取，直接进入后续阶段。")
+    except KeyboardInterrupt:
+        print("\n[急停] Ctrl+C")
+        chassis.stop()
+        res2 = "quit"
+    finally:
+        maintain_stop.set()
+
+    state.res2 = res2   # 语义不变：仍记「第一次」的视觉结果，main() 的 all 模式靠它分支
+
+    trace.report(chassis)
+    return res2
+
+
+# ==================== 分段测试 3/3：橙块 → 返程搭建 ====================
+
+def stage3_return_and_build(chassis, arm, state, pass_no=1):
+    """阶段 8~9：退回橙块初始点 → 返程路线 → 搭建区撞墙 → 三层堆叠。
+
+    起点：车摆在**橙色块撞墙点**（即橙色块阶段结束时的基准原点）。
+    程序启动时握手已把此处记为原点，SEGMENTS_RETURN 的绝对坐标段全部对齐。
+
+    pass_no 只影响「第一大段连做多遍」时的行为：第 2/3 遍在左移撞墙之后、
+    阶段 9 堆叠之前，额外沿车头方向前进/后退一小段，补偿每遍摆放差异。
+    单独跑分段（--stage 3 / all）走默认值 1，与原来完全一致。
+    """
+    print("\n" + "=" * 50)
+    print("  阶段 8: 返程与方块搭建")
+    print("=" * 50)
+    print("  【分段测试 3/3】起点要求：车摆在橙色块撞墙点")
+
+    trace = OdomTrace(chassis, "阶段3 橙块→搭建区（从橙块撞墙点算起）")
+
+    # 6. 执行后退回到我们到达橙色块区域的位置
+    chassis.poll()
+    curr_y_after = chassis.odom_data["rel_y"]
+    diff_y = curr_y_after - state.y_orange_start
+    print(f"[返程] 退回橙色块初始点 (从 Y={curr_y_after:.3f} 回到 Y={state.y_orange_start:.3f})")
+    if abs(diff_y) > 0.005:
+        # 倒车时，vx=-1.0, 沿着负Y方向的车头倒车，实际世界坐标 Y 增加，所以如果是增加，dir=1
+        dir_val = 1 if state.y_orange_start > curr_y_after else -1
+        vx_val = -1.0 if state.y_orange_start > curr_y_after else 1.0
+        seg_back = dict(type="line", vx=vx_val, vy=0.0, axis="y", dir=dir_val,
+                        target=state.y_orange_start, name="退回橙色块初始点")
+        run_segments_sequence(chassis, [seg_back], name="退回初始点")
+
+    # 执行返程路线 (包含平移、旋转、直行等)
+    run_segments_sequence(chassis, SEGMENTS_RETURN, name="返程与对齐工位")
+
+    # 搭建区前撞墙定位 (侧移撞墙)
+    run_wall_hit(chassis, 0.0, VEL, WALL_BUILD_MAX, WALL_BUILD_END_SPEED,
+                 WALL_BUILD_DECEL_DIST, WALL_BUILD_VEL_THRESH,
+                 WALL_BUILD_POS_THRESH, WALL_BUILD_STALL_TIME, "搭建区前左移撞墙")
+
+    # 11.5 第 2/3 遍的附加微调（撞墙定位之后、堆叠之前；第 1 遍完全不加）
+    # 撞墙已经把基准定死，这里只是沿车头方向再挪一小段，位移量由常量给。
+    if pass_no == 2:
+        move_rel(chassis, 1.0, 0.0, PASS2_EXTRA_FORWARD,
+                 f"第2遍附加前进 {PASS2_EXTRA_FORWARD}m", speed=BUILD_OFFSET_SPEED)
+    elif pass_no == 3:
+        move_rel(chassis, -1.0, 0.0, PASS3_EXTRA_BACKWARD,
+                 f"第3遍附加后退 {PASS3_EXTRA_BACKWARD}m", speed=BUILD_OFFSET_SPEED)
+
+    # 12. 进行三个方块的搭建
+    print("\n" + "=" * 50)
+    print("  阶段 9: 开始进行三个方块的堆叠搭建")
+    print("=" * 50)
+
+    if arm is not None:
+        print("[搭建] 1. 将中间橙色块放下搭建第一层")
+        arm.play_action(ID_BUILD_1)
+
+        print("[搭建] 2. 将右侧的橙色块移动到中间框")
+        arm.play_action(ID_BUILD_2)
+
+        print("[搭建] 3. 搭建第二层")
+        arm.play_action(ID_BUILD_3)
+
+        print("[搭建] 4. 将左侧框中的紫色块移动到中间框")
+        arm.play_action(ID_BUILD_4)
+
+        print("[搭建] 5. 搭建第三层")
+        arm.play_action(ID_BUILD_5)
+
+        arm.unload()
+        print("[搭建] 全部搭建完成！")
+    else:
+        print("[跳过搭建] 机械臂未连接")
+
+    trace.report(chassis)
+
+
+# ==================== 第一大段 ×3（比赛流程） ====================
+
+def _still_wait(chassis, seconds, label):
+    """原地静止等待，期间持续保活 A 板心跳。
+
+    这 20 秒是留给裁判席的异常处理窗口：向裁判申请后，人把小车搬回启动区。
+    车本身不动，但链路和 ARMED 状态必须一直活着 —— A 板靠 maintain() 的心跳维持，
+    一旦这里省掉心跳，20 秒后 A 板已经超时/掉使能，第二遍就发不出车了。
+    """
+    print(f"[静止] {label}：保持静止 {seconds} 秒（此间申请异常处理、把车搬回启动区）")
+    chassis.stop()
+    t_end = time.monotonic() + seconds
+    last_tick = None
+    while True:
+        remain = t_end - time.monotonic()
+        if remain <= 0:
+            break
+        chassis.poll()
+        chassis.maintain()
+        check_link(chassis, label)      # 静止期间链路同样不许掉
+        tick = int(math.ceil(remain))
+        if tick != last_tick:
+            print(f"  ... 倒计时 {tick:2d}s")
+            last_tick = tick
+        time.sleep(0.02)
+    chassis.stop()
+    print(f"[静止] {label} 结束")
+
+
+def _wait_until_still(chassis, max_extra_s, label):
+    """等小车真的停稳，返回是否等到了。
+
+    搬车时轮子若被搓动，A 板里程计照样在计数。如果在车还被搬动的瞬间发 odom_reset，
+    零点就定在了半路上，第二遍所有按绝对坐标规划的段会整体偏移（米级）。
+    所以清零前必须确认速度已低于阈值并保持 REST_STILL_HOLD_S。
+    车本来就静止（正常情况）时，这里只花几十毫秒，不产生额外等待。
+    """
+    t0 = time.monotonic()
+    still_since = None
+    warned = False
+    while time.monotonic() - t0 < max_extra_s:
+        chassis.poll()
+        chassis.maintain()
+        check_link(chassis, label)
+        od = chassis.odom_data
+        if abs(od["vx"]) + abs(od["vy"]) + abs(od["wz"]) < REST_VEL_THRESH:
+            if still_since is None:
+                still_since = time.monotonic()
+            elif time.monotonic() - still_since >= REST_STILL_HOLD_S:
+                return True
+        else:
+            still_since = None
+            if not warned:
+                print(f"[清零] 小车仍在移动，等它停稳后再清零（最多再等 {max_extra_s:.0f}s）...")
+                warned = True
+        time.sleep(0.02)
+    return False
+
+
+def clear_all_records(chassis, label):
+    """清零：抹掉 A 板里这一遍累积的里程计基准，把车当前所在处重新定为原点 (0,0,0)。
+
+    必须在车**已经摆回启动区且停稳**之后调用 —— odom_reset 只是把「当前位置」
+    声明成原点，它不会知道车在哪。摆位和清零的顺序反了，第二遍的绝对坐标段
+    就会整体偏移。
+    """
+    if not _wait_until_still(chassis, RESET_REST_WAIT_SECONDS, label):
+        raise MissionAbort(
+            f"{label}：已额外等待 {RESET_REST_WAIT_SECONDS:.0f}s，小车仍未停稳。"
+            f"此时清零会把原点定在半路上，下一遍整体偏移，故中止本轮。"
+            f"请确认小车已放稳在启动区（或调大 config.py 的 RESET_REST_WAIT_SECONDS）。"
+        )
+
+    print(f"[清零] {label}：odom_reset，把车当前位置重新定为原点 (0,0,0)")
+    if not chassis.reset_odometry():
+        raise MissionAbort(
+            f"{label}：odom_reset 多次重发后 A 板仍未确认归零。"
+            f"里程计基准已不可信，继续跑会让后面所有按绝对坐标规划的段整体偏移，故中止本轮。"
+        )
+    od = chassis.odom_data
+    print(f"[清零] 完成：X={od['rel_x']:+.3f} Y={od['rel_y']:+.3f} "
+          f"Yaw={od['rel_yaw'] * 57.2958:+.1f}° —— 本遍之前的记录已全部作废")
+
+
+def run_first_section_thrice(chassis, arm):
+    """第一大段（阶段 1~9）连做 FIRST_SECTION_PASSES 遍，每遍之间静止 + 清零。
+
+    现场流程：
+      第 N 遍搭完第三层 → 车原地静止 20s（这 20 秒向裁判申请异常处理、把车搬回启动区）
+      → 程序自动 odom_reset 清零 → 从阶段 1 重跑。
+      第三遍结束后不再等待，直接停车收尾。
+
+    每遍都用全新的 MissionState：上一遍的抓取微调位移 delta_x_grab、橙块起始 Y
+    y_orange_start 之类全部作废，绝不跨遍沿用 —— 否则阶段 7/8 的「退回原点」段
+    会按上一遍的位移去走，而车已经被搬回启动区、零点完全不同。
+    """
+    for n in range(1, FIRST_SECTION_PASSES + 1):
+        if n > 1:
+            print("\n" + "=" * 68)
+            print(f"  【异常处理窗口】第 {n - 1} 遍第一大段已结束，车已静止")
+            print( "  >>> 现在向裁判申请异常处理，把小车搬回【启动区】 <<<")
+            print(f"  >>> {REPLACE_STILL_SECONDS} 秒倒计时结束后自动清零、重新发车 <<<")
+            print("=" * 68)
+            _still_wait(chassis, REPLACE_STILL_SECONDS, f"第 {n - 1} 遍结束等待")
+            clear_all_records(chassis, f"第 {n} 遍起跑前清零")
+
+        print("\n" + "#" * 68)
+        print(f"#  第一大段（阶段 1~9）  第 {n} / {FIRST_SECTION_PASSES} 遍  开始")
+        print("#" * 68 + "\n")
+
+        state = MissionState()
+        stage1_grab_purple(chassis, arm, state)
+        stage2_grab_orange(chassis, arm, state)
+        stage3_return_and_build(chassis, arm, state, pass_no=n)
+
+        print("\n" + "#" * 68)
+        print(f"#  第一大段 第 {n} / {FIRST_SECTION_PASSES} 遍完成（机械臂已搭完第三层）")
+        print("#" * 68)
+
+    print("\n" + "=" * 68)
+    print(f"  【全部完成】第一大段已连做 {FIRST_SECTION_PASSES} 遍，下面停车结束。")
+    print("=" * 68)
+
+
+# ==================== 主流程 ====================
+
+def main():
+    global _active_chassis
+    ap = argparse.ArgumentParser(description="树莓派运动控制节点")
+    ap.add_argument("chassis_port", nargs="?", default=CHASSIS_PORT)
+    ap.add_argument("arm_port", nargs="?", default=ARM_PORT)
+    ap.add_argument("--stage", choices=["all", "1", "2", "3", "1x3"], default="1x3",
+                    help="跑哪一段："
+                         "1x3=第一大段（阶段 1~9）连做三遍（默认，比赛用）；"
+                         "all=完整 29 阶段流程；"
+                         "1=抓紫块，2=紫块零点→橙块，3=橙块→返程搭建（分段测试）")
+    args = ap.parse_args()
+
+    # ---------- 1. 启动网络客户端线程 ----------
+    threading.Thread(target=vision_client_thread, daemon=True).start()
+    print(f"[初始化] 正在连接视觉节点 {VISION_SERVER_IP}:{VISION_SERVER_PORT} ...")
+
+    # ---------- 2. 连底盘 + 连机械臂 ----------
+    chassis = ChassisDriver(port=args.chassis_port, baudrate=CHASSIS_BAUDRATE, simulate=False)
+    # yaw_tol 0.015 → 0.030 rad（0.86° → 1.7°）。2026-10-03 实机：90° 转弯停在
+    # Δyaw=-89.1°，差 0.9°（=0.0157 rad）刚好卡在 0.015 容差门外。A 板判 COMPLETE
+    # 要求误差持续 100ms 落在容差内（motion.c），0.0157 进不去，板端就一直是 RUNNING，
+    # 只输出 wz = 0.0157 × 2.0 = 0.031 rad/s 这种推不动电机的速度，航向随之冻结，
+    # 上位机的 1.5s 无进展保护随即开火中止整轮。根子是**板端容差比机械能做到的还紧**。
+    # 放宽到 0.030 让板端能正常判到位；真值偏差仍有 ~1° 量级，对定位无影响。
+    chassis.set_motion_limits(max_x=3.0, max_y=3.0, max_yaw=3.1416, max_v=0.6, max_w=1.0,
+                              pos_tol=0.005, yaw_tol=0.030, max_ms=30000)
+    if not chassis.connect():
+        print("[失败] 底盘串口打开失败:", chassis.connection_error)
+        return 1
+
+    t0 = time.monotonic()
+    while not chassis.connection_ready:
+        chassis.poll()
+        if chassis.connection_error or time.monotonic() - t0 > 5:
+            print("[失败] 底盘握手失败:", chassis.connection_error)
+            chassis.disconnect()
+            return 1
+        time.sleep(0.02)
+    _active_chassis = chassis
+    print("底盘就绪")
+
+    actual_arm_port = args.arm_port
+    if not os.path.exists(actual_arm_port):
+        for candidate in ["/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyUSB2"]:
+            if os.path.exists(candidate) and candidate != args.chassis_port:
+                print(f"[提示] 默认机械臂端口 {actual_arm_port} 不存在，自动切换为检测到的 {candidate}")
+                actual_arm_port = candidate
+                break
+
+    # 防呆：底盘口与机械臂口绝不能是同一个物理设备。
+    # 2026-10-03 踩过 —— 旧 udev 规则用 KERNELS=="1-1.1" 匹配祖先节点，接上有源
+    # 拓展坞之后 A 板和机械臂同时命中，ttyAboard 被抢给了机械臂的 CH340。那种情况
+    # 下底盘命令会被原样发到机械臂串口上，而程序不会有任何察觉。这里启动即拦下。
+    if os.path.exists(args.chassis_port) and os.path.exists(actual_arm_port):
+        _chassis_real = os.path.realpath(args.chassis_port)
+        _arm_real = os.path.realpath(actual_arm_port)
+        if _chassis_real == _arm_real:
+            print(f"[致命] 底盘口 {args.chassis_port} 与机械臂口 {actual_arm_port} "
+                  f"指向同一个设备 {_chassis_real}，串口绑定错误，已中止。")
+            print("       检查 /etc/udev/rules.d/99-robot-serial.rules，"
+                  "或重新运行 create_udev.sh。")
+            chassis.disconnect()
+            return 1
+
+    arm = ArmController(port=actual_arm_port, calib_file=CALIB)
+    if not arm.connect():
+        print("[警告] 机械臂连接失败，本次只做路线+视觉停车、不抓取")
+        arm = None
+    else:
+        print("机械臂就绪")
+
+    # 等待视觉节点上线
+    print("[初始化] 等待视觉节点数据...")
+    while not vision_connected:
+        time.sleep(0.5)
+    print(f"[初始化] 视觉节点连接成功！")
+
+    # 检查 A 板是否已解锁 (ARMED, state=4)
+    print("[检查] 正在读取底盘 A 板安全使能状态...")
+    for _ in range(20):
+        chassis.poll()
+        if chassis.odom_data.get("safety_state") == 4:
+            break
+        time.sleep(0.05)
+
+    if chassis.odom_data.get("safety_state") != 4:
+        st = chassis.odom_data.get("safety_state", "未知")
+        print("\n" + "!" * 60)
+        print(f"【重要提示】底盘 A 板当前未解锁！当前状态码: {st} (DISARMED / 红灯)")
+        print("👉 请长按 A 板上的 USER / KEY 按键 1.5 秒解锁！")
+        print("   (听到蜂鸣器提示音、LED 变为绿灯后，小车将自动启动)")
+        print("!" * 60)
+        while chassis.odom_data.get("safety_state") != 4:
+            chassis.poll()
+            # 此时本就还没解锁，故 require_armed=False；只为链路真的掉了时才重连。
+            check_link(chassis, "等待 A 板解锁", require_armed=False)
+            time.sleep(0.2)
+        print("【成功】检测到底盘 A 板已成功解锁 (ARMED / 绿灯)！\n")
+
+    print(f"等待视觉预热 {WARMUP_SECONDS} 秒...")
+    time.sleep(WARMUP_SECONDS)
+    print("[初始化] 视觉预热完成，开始执行任务！")
+
+    # ---------- 3. 按 --stage 选择要跑的段落 ----------
+    #   1x3 = 第一大段（阶段 1~9）连做三遍（默认，比赛用）；all = 完整 29 阶段流程；
+    #   1/2/3 = 只跑对应的分段测试。
+    # 单独跑某一段时，车必须先摆在该段自己的起点上（见各 stage 函数的 docstring）。
+    # 启动握手会把「车当前所在处」清零成原点，所以各段内部的绝对坐标段都能对上。
+    stage = args.stage
+    state = MissionState()
+
+    if stage == "1x3":
+        # 比赛流程：只跑第一大段，连做三遍。三遍跑完直接收尾，
+        # 下面 10~29 阶段（第二大段 / 第三大段）在本模式下完全不进入。
+        aborted = False
+        try:
+            run_first_section_thrice(chassis, arm)
+        except KeyboardInterrupt:
+            aborted = True
+            print("\n[急停] Ctrl+C")
+            chassis.stop()
+            if arm is not None:
+                arm.emergency_stop()
+        chassis.stop()
+        chassis.disconnect()
+        if arm is not None:
+            arm.close()
+        # 急停与正常跑完必须分开报，否则日志看起来像三遍都做完了。
+        print("\n[中止] 用户 Ctrl+C，第一大段 ×3 未跑完" if aborted
+              else "\n[完成] 第一大段 ×3 流程结束")
+        return 0
+
+    if stage != "all":
+        print("")
+        print("=" * 60)
+        print(f"  【分段测试模式】只执行阶段 {stage}，其余阶段全部跳过")
+        print("=" * 60)
+
+    res = "quit"
+    if stage in ("all", "1"):
+        res = stage1_grab_purple(chassis, arm, state)
+
+    if stage == "2" or (stage == "all" and state.res != "quit"):
+        stage2_grab_orange(chassis, arm, state)
+
+    if stage == "3" or (stage == "all" and state.res2 != "quit"):
+        stage3_return_and_build(chassis, arm, state)
+
+    res2 = state.res2
+
+    if res != "quit":
+        # ================== 新增：抓取近侧橙色块与第二次搭建 ==================
+        if res2 != "quit":
+            print("\n" + "="*50)
+            print("  阶段 10: 前往近侧橙色块区域")
+            print("="*50)
+            run_segments_sequence(chassis, SEGMENTS_TO_NEAR_ORANGE, name="前往近侧橙色块区")
+            
+            run_wall_hit(chassis, 0.0, -VEL, WALL_NEAR_ORANGE_MAX, WALL_NEAR_ORANGE_END_SPEED, WALL_NEAR_ORANGE_DECEL_DIST, WALL_NEAR_ORANGE_VEL_THRESH, WALL_NEAR_ORANGE_POS_THRESH, WALL_NEAR_ORANGE_STALL_TIME, "近侧橙色块前右移撞墙", track_axis="y", track_dir=-1, reset_odom=True)
+
+            print("\n" + "="*50)
+            print("  阶段 11: 高位摄像头识别与近侧三块橙色块抓取 (占位)")
+            print("="*50)
+            
+            # 使用现有的视觉微调代码结构作为占位，连续抓取3次
+            maintain_stop = _start_maintain_thread(chassis)
+
+            res_near = "quit"
+            for i, target_arm_id in enumerate([ID_ORANGE_MID, ID2_XML, ID_NEAR_ORANGE_LEFT]):
+                print(f"[视觉占位] 尝试寻找并微调第 {i+1} 个近侧橙色方块...")
+                chassis.poll()
+                try:
+                    res_near, eu_n, ev_n, dx_n, cx_n, cy_n = detect_move(chassis, GRAB_SPEED, GRAB_MAX, f"找近侧橙色块{i+1}", target_type="orange_high", camera_type="high")
+                    if res_near == "timeout":
+                        res_near, eu_n, ev_n, dx_n, cx_n, cy_n = detect_move(chassis, -GRAB_SPEED, GRAB_MAX, f"退回找近侧橙色块{i+1}", target_type="orange_high", camera_type="high")
+                except KeyboardInterrupt:
+                    print("\n[急停] Ctrl+C")
+                    chassis.stop()
+                    res_near = "quit"
+                    break
+
+                if res_near == "aligned" and arm is not None:
+                    print(f"[抓取] 调用机械臂动作 {target_arm_id}...")
+                    arm.play_action(target_arm_id)
+                elif res_near == "aligned":
+                    print("[跳过抓取] 机械臂未连接")
+                    time.sleep(1) # Simulate grab time
+
+            maintain_stop.set()
+            
+            if res_near != "quit":
+                print("\n" + "="*50)
+                print("  阶段 12: 前往第二个搭建区与双重撞墙定位")
+                print("="*50)
+                
+                run_segments_sequence(chassis, SEGMENTS_TO_SECOND_BUILD, name="前往第二次搭建区")
+                
+                # 此时车头向左转了90度，航向为 +90 度。
+                # 1. 前进撞墙定位 (深度/X向)。车身向前(vx>0)，实际移动向全局Y轴正向，所以追踪 axis="y", dir=+1
+                run_wall_hit(chassis, VEL, 0.0, WALL_SECOND_BUILD_FORWARD_MAX, WALL_BUILD_END_SPEED, WALL_BUILD_DECEL_DIST, WALL_BUILD_VEL_THRESH, WALL_BUILD_POS_THRESH, WALL_BUILD_STALL_TIME, "第二次搭建区前进撞墙(仅深度对齐)", track_axis="y", track_dir=1, reset_odom=False)
+                
+                # 2. 左移撞墙定位 (横向/Y向)。车身向左(vy>0)，实际移动向全局X轴负向，所以追踪 axis="x", dir=-1
+                run_wall_hit(chassis, 0.0, VEL, WALL_SECOND_BUILD_LEFT_MAX, WALL_BUILD_END_SPEED, WALL_BUILD_DECEL_DIST, WALL_BUILD_VEL_THRESH, WALL_BUILD_POS_THRESH, WALL_BUILD_STALL_TIME, "第二次搭建区左移撞墙(标定新零点)", track_axis="x", track_dir=-1, reset_odom=True)
+
+                print("\n" + "="*50)
+                print("  阶段 13: 第二次三层方块的堆叠搭建")
+                print("="*50)
+                
+                if arm is not None:
+                    print("[搭建] 1. 将中间框橙色块放下搭建第一层")
+                    arm.play_action(ID_BUILD_1)
+                    print("[搭建] 2. 将右侧的橙色块移动到中间框")
+                    arm.play_action(ID_BUILD_2)
+                    print("[搭建] 3. 搭建第二层")
+                    arm.play_action(ID_BUILD_3)
+                    print("[搭建] 4. 将左侧框中的橙色块移动到中间框")
+                    arm.play_action(ID_BUILD_4)
+                    print("[搭建] 5. 搭建第三层")
+                    arm.play_action(ID_BUILD_5)
+                    arm.unload()
+                    print("[搭建] 第二次全部搭建完成！")
+                else:
+                    print("[跳过搭建] 机械臂未连接")
+
+                # =====================================================================
+                # ----------------- 第三大段：更复杂的折返与搭建流程 ------------------
+                # =====================================================================
+                print("\n" + "="*50)
+                print("  阶段 14: 离开第二搭建区，准备高位抓取")
+                print("="*50)
+                move_rel(chassis, -1.0, 0.0, STAGE14_BACK_1, f"后退{STAGE14_BACK_1}m")
+                run_turn_segment(chassis, {"angle_deg": STAGE14_TURN_1, "name": f"右转{-STAGE14_TURN_1}度"})
+                run_wall_hit(chassis, 0.0, -VEL, STAGE14_WALL_RIGHT_1, WALL_NEAR_ORANGE_END_SPEED, WALL_NEAR_ORANGE_DECEL_DIST, WALL_NEAR_ORANGE_VEL_THRESH, WALL_NEAR_ORANGE_POS_THRESH, WALL_NEAR_ORANGE_STALL_TIME, f"右移撞墙定位{STAGE14_WALL_RIGHT_1}m", track_axis="y", track_dir=-1, reset_odom=True)
+
+                print("\n" + "="*50)
+                print("  阶段 15: 识别并抓取高位橙色块(右侧和中间)")
+                print("="*50)
+                maintain_stop = _start_maintain_thread(chassis)
+                res_stage15 = "quit"
+                for target_arm_id in [ID2_XML, ID_ORANGE_MID]:
+                    chassis.poll()
+                    try:
+                        res_stage15, _, _, _, _, _ = detect_move(chassis, GRAB_SPEED, GRAB_MAX, "找高位橙色块", target_type="orange_high", camera_type="high")
+                        if res_stage15 == "timeout":
+                            res_stage15, _, _, _, _, _ = detect_move(chassis, -GRAB_SPEED, GRAB_MAX, "退回找橙色块", target_type="orange_high", camera_type="high")
+                    except KeyboardInterrupt:
+                        chassis.stop()
+                        res_stage15 = "quit"
+                        break
+                    if res_stage15 == "aligned" and arm is not None:
+                        arm.play_action(target_arm_id)
+                    else:
+                        time.sleep(1)
+                maintain_stop.set()
+
+                if res_stage15 != "quit":
+                    print("\n" + "="*50)
+                    print("  阶段 16: 前往紫色块区域")
+                    print("="*50)
+                    move_rel(chassis, 0.0, 1.0, STAGE16_LEFT_1, f"左移{STAGE16_LEFT_1}m")
+                    move_abs_x(chassis, STAGE16_ABS_X, f"后退到标定零点的后面{STAGE16_ABS_X}m")
+                    run_turn_segment(chassis, {"angle_deg": STAGE16_TURN_1, "name": f"右转{-STAGE16_TURN_1}度"})
+                    move_rel(chassis, 1.0, 0.0, STAGE16_FORWARD_1, f"前进{STAGE16_FORWARD_1}m")
+                    run_wall_hit(chassis, 0.0, VEL, STAGE16_WALL_LEFT_1, WALL_NEAR_ORANGE_END_SPEED, WALL_NEAR_ORANGE_DECEL_DIST, WALL_NEAR_ORANGE_VEL_THRESH, WALL_NEAR_ORANGE_POS_THRESH, WALL_NEAR_ORANGE_STALL_TIME, f"左移撞墙定位{STAGE16_WALL_LEFT_1}m", track_axis="x", track_dir=-1, reset_odom=False)
+
+                    print("\n" + "="*50)
+                    print("  阶段 17: 视觉识别和抓取紫色块")
+                    print("="*50)
+                    maintain_stop = _start_maintain_thread(chassis)
+                    try:
+                        res_stage17, _, _, _, _, _ = detect_move(chassis, GRAB_SPEED, GRAB_MAX, "找紫色块", target_type="purple", camera_type="low")
+                        if res_stage17 == "timeout":
+                            res_stage17, _, _, _, _, _ = detect_move(chassis, -GRAB_SPEED, GRAB_MAX, "退回找紫色块", target_type="purple", camera_type="low")
+                    except KeyboardInterrupt:
+                        chassis.stop()
+                        res_stage17 = "quit"
+                    if res_stage17 == "aligned" and arm is not None:
+                        arm.play_action(ID1_XML)
+                    else:
+                        time.sleep(1)
+                    maintain_stop.set()
+
+                if res_stage15 != "quit" and res_stage17 != "quit":
+                    print("\n" + "="*50)
+                    print("  阶段 18: 返回第三搭建区定位")
+                    print("="*50)
+                    move_rel(chassis, 0.0, -1.0, STAGE18_RIGHT_1, f"右移{STAGE18_RIGHT_1}m")
+                    move_rel(chassis, -1.0, 0.0, STAGE18_BACK_1, f"后退{STAGE18_BACK_1}m")
+                    run_turn_segment(chassis, {"angle_deg": STAGE18_TURN_1, "name": f"左转{STAGE18_TURN_1}度"})
+                    move_rel(chassis, -1.0, 0.0, STAGE18_BACK_2, f"后退{STAGE18_BACK_2}m")
+                    run_wall_hit(chassis, -VEL, 0.0, STAGE18_WALL_BACK_1, WALL_BUILD_END_SPEED, WALL_BUILD_DECEL_DIST, WALL_BUILD_VEL_THRESH, WALL_BUILD_POS_THRESH, WALL_BUILD_STALL_TIME, f"后退撞墙定位{STAGE18_WALL_BACK_1}m", track_axis="x", track_dir=-1, reset_odom=False)
+                    run_wall_hit(chassis, 0.0, VEL, STAGE18_WALL_LEFT_1, WALL_BUILD_END_SPEED, WALL_BUILD_DECEL_DIST, WALL_BUILD_VEL_THRESH, WALL_BUILD_POS_THRESH, WALL_BUILD_STALL_TIME, f"左移撞墙定位{STAGE18_WALL_LEFT_1}m", track_axis="y", track_dir=1, reset_odom=False)
+
+                    print("\n" + "="*50)
+                    print("  阶段 19: 搭建两个橙色块（初始化第三座塔）")
+                    print("="*50)
+                    if arm is not None:
+                        arm.play_action(ID_BUILD_1)
+                        arm.play_action(ID_BUILD_2)
+                        arm.play_action(ID_BUILD_3)
+
+                    print("\n" + "="*50)
+                    print("  阶段 20: 再次前往高位橙色块区")
+                    print("="*50)
+                    move_rel(chassis, 0.0, -1.0, STAGE20_RIGHT_1, f"右移{STAGE20_RIGHT_1}m")
+                    move_rel(chassis, 1.0, 0.0, STAGE20_FORWARD_1, f"前进{STAGE20_FORWARD_1}m")
+                    run_wall_hit(chassis, 0.0, -VEL, STAGE20_WALL_RIGHT_1, WALL_NEAR_ORANGE_END_SPEED, WALL_NEAR_ORANGE_DECEL_DIST, WALL_NEAR_ORANGE_VEL_THRESH, WALL_NEAR_ORANGE_POS_THRESH, WALL_NEAR_ORANGE_STALL_TIME, f"右移撞墙定位{STAGE20_WALL_RIGHT_1}m", track_axis="y", track_dir=-1, reset_odom=False)
+
+                    print("\n" + "="*50)
+                    print("  阶段 21: 再次抓取高位橙色块(右侧和中间)")
+                    print("="*50)
+                    maintain_stop = _start_maintain_thread(chassis)
+                    res_stage21 = "quit"
+                    for target_arm_id in [ID2_XML, ID_ORANGE_MID]:
+                        chassis.poll()
+                        try:
+                            res_stage21, _, _, _, _, _ = detect_move(chassis, GRAB_SPEED, GRAB_MAX, "找高位橙色块", target_type="orange_high", camera_type="high")
+                            if res_stage21 == "timeout":
+                                res_stage21, _, _, _, _, _ = detect_move(chassis, -GRAB_SPEED, GRAB_MAX, "退回找橙色块", target_type="orange_high", camera_type="high")
+                        except KeyboardInterrupt:
+                            chassis.stop()
+                            res_stage21 = "quit"
+                            break
+                        if res_stage21 == "aligned" and arm is not None:
+                            arm.play_action(target_arm_id)
+                        else:
+                            time.sleep(1)
+                    maintain_stop.set()
+
+                if res_stage15 != "quit" and res_stage17 != "quit" and res_stage21 != "quit":
+                    print("\n" + "="*50)
+                    print("  阶段 22: 返回第三搭建区定位")
+                    print("="*50)
+                    move_rel(chassis, 0.0, 1.0, STAGE22_LEFT_1, f"左移{STAGE22_LEFT_1}m")
+                    run_turn_segment(chassis, {"angle_deg": STAGE22_TURN_1, "name": f"左转{STAGE22_TURN_1}度"})
+                    run_wall_hit(chassis, VEL, 0.0, STAGE22_WALL_FORWARD_1, WALL_BUILD_END_SPEED, WALL_BUILD_DECEL_DIST, WALL_BUILD_VEL_THRESH, WALL_BUILD_POS_THRESH, WALL_BUILD_STALL_TIME, f"前进撞墙定位{STAGE22_WALL_FORWARD_1}m", track_axis="y", track_dir=1, reset_odom=False)
+                    move_rel(chassis, 0.0, 1.0, STAGE22_LEFT_2, f"左移{STAGE22_LEFT_2}m")
+                    run_wall_hit(chassis, 0.0, VEL, STAGE22_WALL_LEFT_1, WALL_BUILD_END_SPEED, WALL_BUILD_DECEL_DIST, WALL_BUILD_VEL_THRESH, WALL_BUILD_POS_THRESH, WALL_BUILD_STALL_TIME, f"左移撞墙定位{STAGE22_WALL_LEFT_1}m", track_axis="x", track_dir=-1, reset_odom=False)
+
+                    print("\n" + "="*50)
+                    print("  阶段 23: 搭建第四个橙色块和第五个紫色块")
+                    print("="*50)
+                    if arm is not None:
+                        arm.play_action(ID_BUILD_5)  # 搭建中框(第3层)
+                        arm.play_action(ID_BUILD_4)  # 左紫移到中
+                        arm.play_action(ID_BUILD_6)  # 搭建中框(第4层)
+
+                    print("\n" + "="*50)
+                    print("  阶段 24: 返回橙色块区并重置零点")
+                    print("="*50)
+                    move_rel(chassis, 0.0, -1.0, STAGE24_RIGHT_1, f"右移{STAGE24_RIGHT_1}m")
+                    move_rel(chassis, -1.0, 0.0, STAGE24_BACK_1, f"后退{STAGE24_BACK_1}m")
+                    run_turn_segment(chassis, {"angle_deg": STAGE24_TURN_1, "name": f"右转{-STAGE24_TURN_1}度"})
+                    run_wall_hit(chassis, 0.0, -VEL, STAGE24_WALL_RIGHT_1, WALL_NEAR_ORANGE_END_SPEED, WALL_NEAR_ORANGE_DECEL_DIST, WALL_NEAR_ORANGE_VEL_THRESH, WALL_NEAR_ORANGE_POS_THRESH, WALL_NEAR_ORANGE_STALL_TIME, f"右移撞墙定位{STAGE24_WALL_RIGHT_1}m", track_axis="y", track_dir=-1, reset_odom=True)
+
+                    print("\n" + "="*50)
+                    print("  阶段 25: 抓取橙色块到中间框")
+                    print("="*50)
+                    maintain_stop = _start_maintain_thread(chassis)
+                    try:
+                        res_stage25, _, _, _, _, _ = detect_move(chassis, GRAB_SPEED, GRAB_MAX, "找橙色块", target_type="orange_high", camera_type="high")
+                        if res_stage25 == "timeout":
+                            res_stage25, _, _, _, _, _ = detect_move(chassis, -GRAB_SPEED, GRAB_MAX, "退回找橙色块", target_type="orange_high", camera_type="high")
+                    except KeyboardInterrupt:
+                        chassis.stop()
+                        res_stage25 = "quit"
+                    if res_stage25 == "aligned" and arm is not None:
+                        arm.play_action(ID_ORANGE_MID)
+                    else:
+                        time.sleep(1)
+                    maintain_stop.set()
+
+                if res_stage15 != "quit" and res_stage17 != "quit" and res_stage21 != "quit" and res_stage25 != "quit":
+                    print("\n" + "="*50)
+                    print("  阶段 26: 再次前往紫色块区")
+                    print("="*50)
+                    move_rel(chassis, 0.0, 1.0, STAGE26_LEFT_1, f"左移{STAGE26_LEFT_1}m")
+                    move_abs_x(chassis, STAGE26_ABS_X, f"后退到标定零点的后面{STAGE26_ABS_X}m")
+                    run_turn_segment(chassis, {"angle_deg": STAGE26_TURN_1, "name": f"右转{-STAGE26_TURN_1}度"})
+                    move_rel(chassis, 1.0, 0.0, STAGE26_FORWARD_1, f"前进{STAGE26_FORWARD_1}m")
+                    run_wall_hit(chassis, 0.0, VEL, STAGE26_WALL_LEFT_1, WALL_NEAR_ORANGE_END_SPEED, WALL_NEAR_ORANGE_DECEL_DIST, WALL_NEAR_ORANGE_VEL_THRESH, WALL_NEAR_ORANGE_POS_THRESH, WALL_NEAR_ORANGE_STALL_TIME, f"左移撞墙定位{STAGE26_WALL_LEFT_1}m", track_axis="x", track_dir=-1, reset_odom=False)
+
+                    print("\n" + "="*50)
+                    print("  阶段 27: 视觉识别和抓取紫色块")
+                    print("="*50)
+                    maintain_stop = _start_maintain_thread(chassis)
+                    try:
+                        res_stage27, _, _, _, _, _ = detect_move(chassis, GRAB_SPEED, GRAB_MAX, "找紫色块", target_type="purple", camera_type="low")
+                        if res_stage27 == "timeout":
+                            res_stage27, _, _, _, _, _ = detect_move(chassis, -GRAB_SPEED, GRAB_MAX, "退回找紫色块", target_type="purple", camera_type="low")
+                    except KeyboardInterrupt:
+                        chassis.stop()
+                        res_stage27 = "quit"
+                    if res_stage27 == "aligned" and arm is not None:
+                        arm.play_action(ID1_XML)
+                    else:
+                        time.sleep(1)
+                    maintain_stop.set()
+
+                if res_stage15 != "quit" and res_stage17 != "quit" and res_stage21 != "quit" and res_stage25 != "quit" and res_stage27 != "quit":
+                    print("\n" + "="*50)
+                    print("  阶段 28: 最终返回搭建区")
+                    print("="*50)
+                    move_rel(chassis, 0.0, -1.0, STAGE28_RIGHT_1, f"右移{STAGE28_RIGHT_1}m")
+                    move_rel(chassis, -1.0, 0.0, STAGE28_BACK_1, f"后退{STAGE28_BACK_1}m")
+                    run_turn_segment(chassis, {"angle_deg": STAGE28_TURN_1, "name": f"左转{STAGE28_TURN_1}度"})
+                    move_rel(chassis, -1.0, 0.0, STAGE28_BACK_2, f"后退{STAGE28_BACK_2}m")
+                    run_wall_hit(chassis, -VEL, 0.0, STAGE28_WALL_BACK_1, WALL_BUILD_END_SPEED, WALL_BUILD_DECEL_DIST, WALL_BUILD_VEL_THRESH, WALL_BUILD_POS_THRESH, WALL_BUILD_STALL_TIME, f"后退撞墙定位{STAGE28_WALL_BACK_1}m", track_axis="x", track_dir=-1, reset_odom=False)
+                    run_wall_hit(chassis, 0.0, VEL, STAGE28_WALL_LEFT_1, WALL_BUILD_END_SPEED, WALL_BUILD_DECEL_DIST, WALL_BUILD_VEL_THRESH, WALL_BUILD_POS_THRESH, WALL_BUILD_STALL_TIME, f"左移撞墙定位{STAGE28_WALL_LEFT_1}m", track_axis="y", track_dir=1, reset_odom=False)
+
+                    print("\n" + "="*50)
+                    print("  阶段 29: 继续搭建两个橙色块和一个紫色块（完成第三座塔）")
+                    print("="*50)
+                    if arm is not None:
+                        arm.play_action(ID_BUILD_1)
+                        arm.play_action(ID_BUILD_2)
+                        arm.play_action(ID_BUILD_3)
+                        arm.play_action(ID_BUILD_4)
+                        arm.play_action(ID_BUILD_5)
+                        arm.play_action(ID_BUILD_6)
+                        arm.play_action(ID_BUILD_7)
+                        arm.unload()
+                        print("[全部流程] 所有赛事堆叠任务宣告彻底完成！")
+
+    # ---------- 收尾 ----------
+    chassis.stop()
+    chassis.disconnect()
+    if arm is not None:
+        arm.close()
+    print("\n[完成] 比赛流程结束")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except MissionAbort as exc:
+        print("\n" + "!" * 64)
+        print(f"【本轮中止】{exc}")
+        print("-" * 64)
+        if isinstance(exc, ChassisLinkLost):
+            print("根因几乎总是硬件：A 板链路走的是 MuseLab nanoUART 这颗 USB 桥，")
+            print("树莓派供电欠压时它会周期性重新枚举（dmesg 里 USB 1-1.1 反复 disconnect）。")
+            print("此时 A 板若跟着掉电重启，会退回未解锁状态，里程计基准丢失 —— 本轮无法续跑。")
+            print()
+            print("排查顺序：")
+            print("  1) vcgencmd get_throttled —— 若有 0x10000/0x40000 位，说明确实欠压，换 5V/3A 以上电源")
+            print("  2) 把 nanoUART 从板载 hub 上挪开：直接插 Pi 的 USB3(蓝口) 或用带供电的 hub")
+            print("     （现在 A 板 / 网卡 AX88179 / 机械臂 CH340 三个设备挤在同一个 VL805 hub 上）")
+            print("  3) 换一根短一些、屏蔽好的 USB 线，插头插到底")
+            print("  4) 重新解锁 A 板后，再运行本程序")
+        else:
+            print("这不是通信中断，是流程自身的保护性中止：某个动作没能确认完成，")
+            print("继续走下去会让后续按绝对坐标规划的段全部落在错误的位置上。")
+            print()
+            print("排查顺序：")
+            print("  1) 往上翻日志，看最后一条 [位移] / [视觉] 打印停在哪个阶段")
+            print("  2) 若停在检测/前进微调段：多半是车顶住了方块或挡板在打滑，检查现场是否卡住")
+            print("  3) 若是 odom_reset 未获应答：A 板当时可能正忙或已半掉线，重启 A 板后重跑")
+        print("!" * 64)
+        if _active_chassis is not None:
+            try:
+                _active_chassis.stop()
+                _active_chassis.disconnect()
+            except Exception:
+                pass
+        sys.exit(2)

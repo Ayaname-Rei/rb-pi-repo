@@ -1,0 +1,14 @@
+# RoboGame 2026 综合自动任务 —— Python 依赖清单
+# 复现 run_mission.py 所需；在 Python 3.13（D:\anaconda\python.exe）下验证通过。
+# 安装：pip install -r requirements.txt
+
+ultralytics==8.4.154
+opencv-python==5.0.0.93
+numpy==2.3.5
+pyserial==3.5
+torch==2.7.1
+
+# 说明：
+# - torch 默认装 CPU 版（可移植、复现一致）。如需 GPU 加速（CUDA 12.8）：
+#     pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+# - ultralytics 会一并拉取 torchvision / matplotlib 等传递依赖，无需手动列全。
