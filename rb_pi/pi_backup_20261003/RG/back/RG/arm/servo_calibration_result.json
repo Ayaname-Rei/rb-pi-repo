@@ -1,0 +1,38 @@
+{
+    "claw_1": {
+        "open": 281,
+        "grip": 453,
+        "min": 100,
+        "max": 900
+    },
+    "wrist_roll_2": {
+        "zero": 509,
+        "min": 100,
+        "max": 900,
+        "direction": 1
+    },
+    "wrist_pitch_3": {
+        "zero": 649,
+        "min": null,
+        "max": null,
+        "direction": 1
+    },
+    "elbow_pitch_4": {
+        "zero": 306,
+        "min": null,
+        "max": null,
+        "direction": 1
+    },
+    "shoulder_pitch_5": {
+        "zero": 485,
+        "min": null,
+        "max": null,
+        "direction": 1
+    },
+    "base_yaw_6": {
+        "zero": 496,
+        "min": null,
+        "max": null,
+        "direction": 1
+    }
+}

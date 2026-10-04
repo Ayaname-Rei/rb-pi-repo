@@ -1,0 +1,13 @@
+# Exclude Orange Pi OS system images (exceeds GitHub file limit of 100MB, ~4.7GB)
+Orange_pi/
+
+# Exclude RoboGame-Team (tracked in its own separate repository)
+RoboGame-Team/
+
+# Python cache & system files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.DS_Store
+Thumbs.db

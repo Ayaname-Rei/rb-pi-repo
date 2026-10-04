@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ActionGroup name="pick_and_put_purple_v1" total_frames="19">
+  <Frame index="1" name="动作_1" time="500" interp="LINEAR">
+    <Cartesian X="13.96" Y="-0.23" Z="8.12" Pitch="-73.7"/>
+    <Servos S1="50" S2="503" S3="294" S4="285" S5="416" S6="492"/>
+    <Claw state="OPEN"/>
+  </Frame>
+  <Frame index="2" name="动作_2" time="500" interp="JOINT">
+    <Cartesian X="-0.23" Y="13.96" Z="8.12" Pitch="-73.7"/>
+    <Servos S1="50" S2="503" S3="294" S4="285" S5="416" S6="875"/>
+    <Claw state="OPEN"/>
+  </Frame>
+  <Frame index="3" name="动作_3" time="500" interp="JOINT">
+    <Cartesian X="-0.37" Y="21.91" Z="35.59" Pitch="3.4"/>
+    <Servos S1="50" S2="503" S3="450" S4="450" S5="416" S6="875"/>
+    <Claw state="OPEN"/>
+  </Frame>
+  <Frame index="4" name="动作_4_停留" time="200" interp="LINEAR">
+    <Cartesian X="-0.37" Y="21.91" Z="35.59" Pitch="3.4"/>
+    <Servos S1="50" S2="503" S3="450" S4="450" S5="416" S6="875"/>
+    <Claw state="OPEN"/>
+  </Frame>
+  <Frame index="5" name="动作_5" time="500" interp="LINEAR">
+    <Cartesian X="-0.64" Y="38.23" Z="27.72" Pitch="-0.2"/>
+    <Servos S1="50" S2="503" S3="569" S4="450" S5="550" S6="875"/>
+    <Claw state="OPEN"/>
+  </Frame>
+  <Frame index="6" name="动作_6" time="500" interp="LINEAR">
+    <Cartesian X="-0.76" Y="45.53" Z="0.50" Pitch="-36.2"/>
+    <Servos S1="50" S2="503" S3="569" S4="450" S5="700" S6="875"/>
+    <Claw state="OPEN"/>
+  </Frame>
+  <Frame index="7" name="动作_7_停留" time="200" interp="LINEAR">
+    <Cartesian X="-0.76" Y="45.53" Z="0.50" Pitch="-36.2"/>
+    <Servos S1="50" S2="503" S3="569" S4="450" S5="700" S6="875"/>
+    <Claw state="OPEN"/>
+  </Frame>
+  <Frame index="8" name="动作_8" time="500" interp="LINEAR">
+    <Cartesian X="-0.76" Y="45.53" Z="0.50" Pitch="-36.2"/>
+    <Servos S1="500" S2="503" S3="569" S4="450" S5="700" S6="875"/>
+    <Claw state="GRIP"/>
+  </Frame>
+  <Frame index="9" name="动作_9_停留" time="200" interp="LINEAR">
+    <Cartesian X="-0.76" Y="45.53" Z="0.50" Pitch="-36.2"/>
+    <Servos S1="500" S2="503" S3="569" S4="450" S5="700" S6="875"/>
+    <Claw state="GRIP"/>
+  </Frame>
+  <Frame index="10" name="动作_10" time="2000" interp="JOINT">
+    <Cartesian X="-0.32" Y="19.15" Z="44.27" Pitch="31.9"/>
+    <Servos S1="500" S2="503" S3="569" S4="450" S5="416" S6="875"/>
+    <Claw state="GRIP"/>
+  </Frame>
+  <Frame index="11" name="动作_11_停留" time="500" interp="JOINT">
+    <Cartesian X="-0.32" Y="19.15" Z="44.27" Pitch="31.9"/>
+    <Servos S1="500" S2="503" S3="569" S4="450" S5="416" S6="875"/>
+    <Claw state="GRIP"/>
+  </Frame>
+  <Frame index="12" name="动作_12" time="750" interp="JOINT">
+    <Cartesian X="-0.43" Y="25.40" Z="26.59" Pitch="-22.3"/>
+    <Servos S1="500" S2="503" S3="380" S4="450" S5="453" S6="875"/>
+    <Claw state="GRIP"/>
+  </Frame>
+  <Frame index="13" name="动作_13" time="500" interp="JOINT">
+    <Cartesian X="16.68" Y="19.16" Z="26.59" Pitch="-22.3"/>
+    <Servos S1="500" S2="503" S3="380" S4="450" S5="453" S6="700"/>
+    <Claw state="GRIP"/>
+  </Frame>
+  <Frame index="14" name="动作_14" time="500" interp="LINEAR">
+    <Cartesian X="12.47" Y="14.32" Z="15.27" Pitch="-46.8"/>
+    <Servos S1="500" S2="503" S3="350" S4="325" S5="400" S6="700"/>
+    <Claw state="GRIP"/>
+  </Frame>
+  <Frame index="15" name="动作_15" time="750" interp="LINEAR">
+    <Cartesian X="14.70" Y="16.88" Z="6.48" Pitch="-70.8"/>
+    <Servos S1="500" S2="503" S3="350" S4="325" S5="500" S6="700"/>
+    <Claw state="GRIP"/>
+  </Frame>
+  <Frame index="16" name="动作_16_停留" time="200" interp="LINEAR">
+    <Cartesian X="14.70" Y="16.88" Z="6.48" Pitch="-70.8"/>
+    <Servos S1="500" S2="503" S3="350" S4="325" S5="500" S6="700"/>
+    <Claw state="GRIP"/>
+  </Frame>
+  <Frame index="17" name="动作_17" time="500" interp="LINEAR">
+    <Cartesian X="14.70" Y="16.88" Z="6.48" Pitch="-70.8"/>
+    <Servos S1="50" S2="503" S3="350" S4="325" S5="500" S6="700"/>
+    <Claw state="OPEN"/>
+  </Frame>
+  <Frame index="18" name="动作_18" time="500" interp="LINEAR">
+    <Cartesian X="12.47" Y="14.32" Z="15.27" Pitch="-46.8"/>
+    <Servos S1="50" S2="503" S3="350" S4="325" S5="400" S6="700"/>
+    <Claw state="OPEN"/>
+  </Frame>
+  <Frame index="19" name="动作_19" time="500" interp="JOINT">
+    <Cartesian X="13.96" Y="-0.23" Z="8.12" Pitch="-73.7"/>
+    <Servos S1="50" S2="503" S3="294" S4="285" S5="416" S6="492"/>
+    <Claw state="OPEN"/>
+  </Frame>
+</ActionGroup>
